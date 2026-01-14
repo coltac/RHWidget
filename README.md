@@ -43,4 +43,13 @@ Open Robinhood Legend. A "Momo Screener" panel appears on the right.
 - Clicking a ticker tries to activate it in Legend by finding a search/symbol input and typing + pressing Enter.
 - If it can't find the input, it copies the ticker to your clipboard as a fallback.
 
+### Training buttons
+
+The widget header has two small training buttons:
+
+- **B (Bind symbol input):** click this, then click the Legend symbol/search input. This teaches the widget where to click and type when you click a ticker.
+- **T (Train active symbol):** click this, then drag a box around the on-screen symbol/ticker that represents the current active chart. This lets hotkeys (buy/sell) know which symbol is active.
+
+Press `Esc` to cancel a training mode.
+
 Extension settings are in the extension's Options page (server URL, poll interval, max tickers).
