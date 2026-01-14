@@ -31,7 +31,7 @@ python momo_bridge_server.py --headful
 
 The API will be available at `http://127.0.0.1:8787/api/tickers`.
 
-## 3) Load the extension (Chrome)
+## 3) Load the extension (Chrome, Brave, Edge ect)
 
 1. Open `chrome://extensions`
 2. Enable **Developer mode**
