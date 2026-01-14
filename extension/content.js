@@ -839,6 +839,10 @@
           <label>Offset</label>
           <input class="limit-input" type="number" step="0.01" />
         </div>
+        <div class="trade-status" title="Trade status">
+          <span class="dot"></span>
+          <span class="text">trade idle</span>
+        </div>
       </div>
       <div class="grid">
         <table class="table">
@@ -1162,6 +1166,15 @@
     label.textContent = text;
   }
 
+  function setTradeStatus(ui, kind, text) {
+    const dot = ui.wrap.querySelector(".trade-status .dot");
+    const label = ui.wrap.querySelector(".trade-status .text");
+    if (!dot || !label) return;
+    dot.className = "dot";
+    if (kind) dot.classList.add(kind);
+    label.textContent = text || "";
+  }
+
   function render(ui, data, cfg) {
     const updatedAt = ui.wrap.querySelector(".updated-at");
     updatedAt.textContent = data?.updated_at ? new Date(data.updated_at).toLocaleTimeString() : "—";
@@ -1283,6 +1296,7 @@
     const symbol = detectActiveSymbol(ui);
     if (!symbol) {
       setStatus(ui, "warn", "no active symbol");
+      setTradeStatus(ui, "warn", "no active symbol");
       await sleep(800);
       setStatus(ui, "ok", "live");
       return;
@@ -1291,6 +1305,7 @@
     const limitOffset = String(currentCfg.limitOffset || currentCfg.limitPrice || "").trim();
     if (orderType === "limit" && !limitOffset) {
       setStatus(ui, "warn", "offset needed");
+      setTradeStatus(ui, "warn", "offset needed");
       await sleep(800);
       setStatus(ui, "ok", "live");
       return;
@@ -1299,6 +1314,7 @@
     if (side === "buy") payload.qty = Number(currentCfg.buyQty || 1);
 
     try {
+      setTradeStatus(ui, "connecting", `${side} submitting`);
       const url = `${currentCfg.apiBase.replace(/\/$/, "")}/api/trade/${side}`;
       const res = await fetch(url, {
         method: "POST",
@@ -1308,12 +1324,15 @@
       if (!res.ok) {
         const err = await res.text();
         setStatus(ui, "err", `${side} failed`);
+        setTradeStatus(ui, "err", `${side} failed`);
         console.warn("[RHWidget] trade error", err);
       } else {
         setStatus(ui, "ok", `${side} sent ${symbol}`);
+        setTradeStatus(ui, "ok", `${side} sent ${symbol}`);
       }
     } catch {
       setStatus(ui, "err", "trade failed");
+      setTradeStatus(ui, "err", `${side} failed`);
     }
     await sleep(900);
     setStatus(ui, "ok", "live");

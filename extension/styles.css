@@ -208,6 +208,20 @@ table.table td[data-signed="zero"] {
   font-size: 12px;
 }
 
+.trade-status {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #9fb0c7;
+}
+
+.trade-status .text {
+  white-space: nowrap;
+}
+
+
 .toggle-group {
   display: inline-flex;
   gap: 4px;

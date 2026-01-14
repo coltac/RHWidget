@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import os
 import pickle
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -416,6 +417,7 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
 
     @app.post("/api/trade/buy")
     async def trade_buy(payload: BuyRequest = Body(...)) -> JSONResponse:
+        start_ts = time.monotonic()
         await ensure_logged_in()
         symbol = (payload.symbol or "").strip().upper()
         if not symbol:
@@ -426,7 +428,9 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
         order_type = normalize_order_type(payload.order_type)
         if order_type == "limit":
             if payload.limit_offset is not None:
+                quote_start = time.monotonic()
                 last = await asyncio.to_thread(get_latest_price, symbol)
+                print(f"[trade] buy quote {symbol} {time.monotonic() - quote_start:.3f}s")
                 if last is None:
                     raise HTTPException(status_code=502, detail="quote_unavailable")
                 limit = last + float(payload.limit_offset)
@@ -437,13 +441,19 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
             if limit <= 0:
                 raise HTTPException(status_code=400, detail="invalid_limit_price")
             limit = round_price(limit)
+            order_start = time.monotonic()
             result = await asyncio.to_thread(rh.orders.order_buy_limit, symbol, qty, limit, None, "gfd")
+            print(f"[trade] buy limit submit {symbol} {time.monotonic() - order_start:.3f}s")
         else:
+            order_start = time.monotonic()
             result = await asyncio.to_thread(rh.orders.order_buy_market, symbol, qty)
+            print(f"[trade] buy market submit {symbol} {time.monotonic() - order_start:.3f}s")
+        print(f"[trade] buy total {symbol} {time.monotonic() - start_ts:.3f}s")
         return JSONResponse({"ok": True, "result": result})
 
     @app.post("/api/trade/sell")
     async def trade_sell(payload: SellRequest = Body(...)) -> JSONResponse:
+        start_ts = time.monotonic()
         await ensure_logged_in()
         symbol = (payload.symbol or "").strip().upper()
         if not symbol:
@@ -454,7 +464,9 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
         order_type = normalize_order_type(payload.order_type)
         if order_type == "limit":
             if payload.limit_offset is not None:
+                quote_start = time.monotonic()
                 last = await asyncio.to_thread(get_latest_price, symbol)
+                print(f"[trade] sell quote {symbol} {time.monotonic() - quote_start:.3f}s")
                 if last is None:
                     raise HTTPException(status_code=502, detail="quote_unavailable")
                 limit = last - float(payload.limit_offset)
@@ -465,9 +477,14 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
             if limit <= 0:
                 raise HTTPException(status_code=400, detail="invalid_limit_price")
             limit = round_price(limit)
+            order_start = time.monotonic()
             result = await asyncio.to_thread(rh.orders.order_sell_limit, symbol, qty, limit, None, "gfd")
+            print(f"[trade] sell limit submit {symbol} {time.monotonic() - order_start:.3f}s")
         else:
+            order_start = time.monotonic()
             result = await asyncio.to_thread(rh.orders.order_sell_market, symbol, qty)
+            print(f"[trade] sell market submit {symbol} {time.monotonic() - order_start:.3f}s")
+        print(f"[trade] sell total {symbol} {time.monotonic() - start_ts:.3f}s")
         return JSONResponse({"ok": True, "result": result})
 
     @app.get("/api/tickers")
