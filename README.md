@@ -52,4 +52,20 @@ The widget header has two small training buttons:
 
 Press `Esc` to cancel a training mode.
 
+### Hotkeys
+
+- **Buy:** `Shift+1`
+- **Sell:** `Shift+2`
+
+Hotkeys only fire while you are on the Legend page and not typing in an input field.
+
+### Market vs Limit orders
+
+- **Market:** sends a market order immediately.
+- **Limit:** uses the offset box in the widget.
+  - **Buy limit:** `last price + offset`
+  - **Sell limit:** `last price - offset`
+
+Buy orders use the **Qty** field. Sell orders use your full open position for the active symbol.
+
 Extension settings are in the extension's Options page (server URL, poll interval, max tickers).
