@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import math
 import os
 import pickle
 import time
@@ -48,10 +49,10 @@ class SmsCodeRequest(BaseModel):
 
 class BuyRequest(BaseModel):
     symbol: str
-    qty: float = 1.0
+    qty: float | None = 1.0
+    amount_usd: float | None = None
     order_type: str = "market"
     limit_price: float | None = None
-    limit_offset: float | None = None
     limit_offset: float | None = None
 
 
@@ -354,8 +355,9 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
 
     def get_position_qty(symbol: str) -> float:
         try:
-            instrument = rh.stocks.get_instrument_by_symbol(symbol)
-            inst_url = instrument.get("url") if instrument else None
+            instruments = rh.stocks.get_instruments_by_symbols(symbol) or []
+            instrument = instruments[0] if instruments else None
+            inst_url = instrument.get("url") if isinstance(instrument, dict) else None
             if not inst_url:
                 return 0.0
             positions = rh.account.get_open_stock_positions() or []
@@ -365,6 +367,73 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
         except Exception:
             return 0.0
         return 0.0
+
+    def _order_error_detail(result: Any) -> str | None:
+        if result is None:
+            return "order_submit_failed"
+        if not isinstance(result, dict):
+            return "unexpected_order_response"
+        detail = result.get("detail")
+        if isinstance(detail, str) and detail.strip():
+            return detail.strip()
+        err = result.get("error")
+        if isinstance(err, str) and err.strip():
+            return err.strip()
+        msg = result.get("message")
+        if isinstance(msg, str) and msg.strip():
+            return msg.strip()
+        non_field = result.get("non_field_errors")
+        if isinstance(non_field, list) and non_field and isinstance(non_field[0], str):
+            return non_field[0].strip() or None
+        return None
+
+    def _order_state(result: Any) -> tuple[str | None, str | None, str | None]:
+        if not isinstance(result, dict):
+            return None, None, None
+        order_id = result.get("id") if isinstance(result.get("id"), str) else None
+        state = result.get("state") if isinstance(result.get("state"), str) else None
+        reject = result.get("reject_reason")
+        reject_reason = reject if isinstance(reject, str) and reject.strip() else None
+        return order_id, state, reject_reason
+
+    def _require_order_ok(result: Any) -> dict[str, Any]:
+        err = _order_error_detail(result)
+        order_id, state, reject_reason = _order_state(result)
+        if order_id or state or reject_reason:
+            print(f"[trade] order status id={order_id or '-'} state={state or '-'} reject={reject_reason or '-'}")
+        if reject_reason:
+            raise HTTPException(status_code=400, detail=reject_reason)
+        if state in {"rejected", "failed", "canceled"}:
+            raise HTTPException(status_code=400, detail=f"order_{state}")
+        if err and not order_id and not state:
+            print(f"[trade] order error {err}")
+            if err in {"order_submit_failed", "unexpected_order_response"}:
+                raise HTTPException(status_code=502, detail=err)
+            raise HTTPException(status_code=400, detail=err)
+        if isinstance(result, dict) and (order_id or state):
+            return {"id": order_id, "state": state, "reject_reason": reject_reason}
+        raise HTTPException(status_code=502, detail="unexpected_order_response")
+
+    async def _refresh_stock_order(order: dict[str, Any]) -> dict[str, Any]:
+        order_id = order.get("id")
+        state = order.get("state")
+        if not order_id or not isinstance(order_id, str):
+            return order
+        if state != "unconfirmed":
+            return order
+
+        for delay_s in (0.25, 0.5, 0.75):
+            await asyncio.sleep(delay_s)
+            info = await asyncio.to_thread(rh.orders.get_stock_order_info, order_id)
+            _, new_state, reject_reason = _order_state(info)
+            if reject_reason:
+                order["reject_reason"] = reject_reason
+                return order
+            if new_state and new_state != state:
+                order["state"] = new_state
+                return order
+
+        return order
 
     @app.get("/api/health")
     async def health() -> dict[str, str]:
@@ -422,34 +491,82 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
         symbol = (payload.symbol or "").strip().upper()
         if not symbol:
             raise HTTPException(status_code=400, detail="missing_symbol")
-        qty = float(payload.qty or 0)
-        if qty <= 0:
-            raise HTTPException(status_code=400, detail="invalid_qty")
         order_type = normalize_order_type(payload.order_type)
-        if order_type == "limit":
-            if payload.limit_offset is not None:
+
+        if payload.amount_usd is not None:
+            amount_usd = float(payload.amount_usd or 0)
+            if amount_usd <= 0:
+                raise HTTPException(status_code=400, detail="invalid_amount_usd")
+
+            if order_type == "limit":
+                if payload.limit_offset is not None:
+                    quote_start = time.monotonic()
+                    last = await asyncio.to_thread(get_latest_price, symbol)
+                    print(f"[trade] buy quote {symbol} {time.monotonic() - quote_start:.3f}s")
+                    if last is None:
+                        raise HTTPException(status_code=502, detail="quote_unavailable")
+                    limit = last + float(payload.limit_offset)
+                elif payload.limit_price is not None:
+                    limit = float(payload.limit_price)
+                else:
+                    raise HTTPException(status_code=400, detail="missing_limit_offset")
+
+                if limit <= 0:
+                    raise HTTPException(status_code=400, detail="invalid_limit_price")
+                limit = round_price(limit)
+
+                qty_whole = int(math.floor(amount_usd / float(limit)))
+                if qty_whole <= 0:
+                    raise HTTPException(status_code=400, detail="amount_too_small_for_limit")
+                print(f"[trade] buy dollars->shares {symbol} ${amount_usd:.2f} @ {limit:.4f} => {qty_whole} sh")
+                order_start = time.monotonic()
+                result = await asyncio.to_thread(rh.orders.order_buy_limit, symbol, qty_whole, limit, None, "gfd")
+                print(f"[trade] buy limit submit {symbol} {time.monotonic() - order_start:.3f}s")
+            else:
                 quote_start = time.monotonic()
                 last = await asyncio.to_thread(get_latest_price, symbol)
                 print(f"[trade] buy quote {symbol} {time.monotonic() - quote_start:.3f}s")
-                if last is None:
+                if last is None or last <= 0:
                     raise HTTPException(status_code=502, detail="quote_unavailable")
-                limit = last + float(payload.limit_offset)
-            elif payload.limit_price is not None:
-                limit = float(payload.limit_price)
-            else:
-                raise HTTPException(status_code=400, detail="missing_limit_offset")
-            if limit <= 0:
-                raise HTTPException(status_code=400, detail="invalid_limit_price")
-            limit = round_price(limit)
-            order_start = time.monotonic()
-            result = await asyncio.to_thread(rh.orders.order_buy_limit, symbol, qty, limit, None, "gfd")
-            print(f"[trade] buy limit submit {symbol} {time.monotonic() - order_start:.3f}s")
+                qty_whole = int(math.floor(amount_usd / float(last)))
+                if qty_whole <= 0:
+                    raise HTTPException(status_code=400, detail="amount_too_small_for_market")
+                print(f"[trade] buy dollars->shares {symbol} ${amount_usd:.2f} @ {last:.4f} => {qty_whole} sh")
+                order_start = time.monotonic()
+                result = await asyncio.to_thread(rh.orders.order_buy_market, symbol, qty_whole, None, "gfd")
+                print(f"[trade] buy market submit {symbol} {time.monotonic() - order_start:.3f}s")
         else:
-            order_start = time.monotonic()
-            result = await asyncio.to_thread(rh.orders.order_buy_market, symbol, qty)
-            print(f"[trade] buy market submit {symbol} {time.monotonic() - order_start:.3f}s")
+            qty = float(payload.qty or 0)
+            if qty <= 0:
+                raise HTTPException(status_code=400, detail="invalid_qty")
+            qty_whole = int(math.floor(qty))
+            if qty_whole <= 0 or abs(qty - qty_whole) > 1e-9:
+                raise HTTPException(status_code=400, detail="invalid_qty")
+            if order_type == "limit":
+                if payload.limit_offset is not None:
+                    quote_start = time.monotonic()
+                    last = await asyncio.to_thread(get_latest_price, symbol)
+                    print(f"[trade] buy quote {symbol} {time.monotonic() - quote_start:.3f}s")
+                    if last is None:
+                        raise HTTPException(status_code=502, detail="quote_unavailable")
+                    limit = last + float(payload.limit_offset)
+                elif payload.limit_price is not None:
+                    limit = float(payload.limit_price)
+                else:
+                    raise HTTPException(status_code=400, detail="missing_limit_offset")
+                if limit <= 0:
+                    raise HTTPException(status_code=400, detail="invalid_limit_price")
+                limit = round_price(limit)
+                order_start = time.monotonic()
+                result = await asyncio.to_thread(rh.orders.order_buy_limit, symbol, qty_whole, limit, None, "gfd")
+                print(f"[trade] buy limit submit {symbol} {time.monotonic() - order_start:.3f}s")
+            else:
+                order_start = time.monotonic()
+                result = await asyncio.to_thread(rh.orders.order_buy_market, symbol, qty_whole, None, "gfd")
+                print(f"[trade] buy market submit {symbol} {time.monotonic() - order_start:.3f}s")
         print(f"[trade] buy total {symbol} {time.monotonic() - start_ts:.3f}s")
-        return JSONResponse({"ok": True, "result": result})
+        order = await _refresh_stock_order(_require_order_ok(result))
+        return JSONResponse({"ok": True, "order": order, "result": result})
 
     @app.post("/api/trade/sell")
     async def trade_sell(payload: SellRequest = Body(...)) -> JSONResponse:
@@ -477,15 +594,24 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
             if limit <= 0:
                 raise HTTPException(status_code=400, detail="invalid_limit_price")
             limit = round_price(limit)
+            qty_whole = int(math.floor(qty))
+            if qty_whole <= 0:
+                raise HTTPException(status_code=400, detail="no_whole_shares_for_limit")
             order_start = time.monotonic()
-            result = await asyncio.to_thread(rh.orders.order_sell_limit, symbol, qty, limit, None, "gfd")
+            result = await asyncio.to_thread(rh.orders.order_sell_limit, symbol, qty_whole, limit, None, "gfd")
             print(f"[trade] sell limit submit {symbol} {time.monotonic() - order_start:.3f}s")
         else:
+            qty_is_whole = abs(qty - round(qty)) < 1e-6
             order_start = time.monotonic()
-            result = await asyncio.to_thread(rh.orders.order_sell_market, symbol, qty)
+            if qty_is_whole:
+                result = await asyncio.to_thread(rh.orders.order_sell_market, symbol, int(round(qty)), None, "gfd")
+            else:
+                qty_frac = round(float(qty), 6)
+                result = await asyncio.to_thread(rh.orders.order_sell_fractional_by_quantity, symbol, qty_frac)
             print(f"[trade] sell market submit {symbol} {time.monotonic() - order_start:.3f}s")
         print(f"[trade] sell total {symbol} {time.monotonic() - start_ts:.3f}s")
-        return JSONResponse({"ok": True, "result": result})
+        order = await _refresh_stock_order(_require_order_ok(result))
+        return JSONResponse({"ok": True, "order": order, "result": result})
 
     @app.get("/api/tickers")
     async def tickers() -> JSONResponse:

@@ -69,6 +69,9 @@ Hotkeys only fire while you are on the Legend page and not typing in an input fi
   - **Buy limit:** `last price + offset`
   - **Sell limit:** `last price - offset`
 
-Buy orders use the **Qty** field. Sell orders use your full open position for the active symbol.
+Buy orders use the widget's **Buy** field: toggle **SH** for shares or **$** for dollars.
+- **$ + Market** converts dollars to a whole-share quantity using the latest quote (rounds down).
+- **$ + Limit** converts dollars to a whole-share quantity at the computed limit price (rounds down).
+Sell orders use your full open position for the active symbol.
 
 Extension settings are in the extension's Options page (server URL, poll interval, max tickers).

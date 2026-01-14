@@ -14,6 +14,7 @@
     widgetPos: null,
     widgetSize: null,
     orderType: "market",
+    buyQtyMode: "dollars",
     buyQty: 1,
     limitOffset: ""
   };
@@ -832,7 +833,11 @@
           <button class="toggle-btn" data-value="limit" type="button">LMT</button>
         </div>
         <div class="field">
-          <label>Qty</label>
+          <label>Buy</label>
+          <div class="toggle-group qty-mode" title="Buy amount mode">
+            <button class="toggle-btn" data-value="shares" type="button">SH</button>
+            <button class="toggle-btn" data-value="dollars" type="button">$</button>
+          </div>
           <input class="qty-input" type="number" min="1" step="1" />
         </div>
         <div class="field limit-only">
@@ -928,12 +933,21 @@
     });
 
     const orderButtons = wrap.querySelectorAll(".order-type .toggle-btn");
+    const modeButtons = wrap.querySelectorAll(".qty-mode .toggle-btn");
     const qtyInput = wrap.querySelector(".qty-input");
     const limitInput = wrap.querySelector(".limit-input");
     orderButtons.forEach((btn) => {
       btn.addEventListener("click", (e) => {
         e.preventDefault();
         orderButtons.forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        saveTradeConfig({ wrap });
+      });
+    });
+    modeButtons.forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        modeButtons.forEach((b) => b.classList.remove("active"));
         btn.classList.add("active");
         saveTradeConfig({ wrap });
       });
@@ -1106,6 +1120,31 @@
     return String(value || "").toLowerCase() === "limit" ? "limit" : "market";
   }
 
+  function normalizeBuyQtyMode(value) {
+    return String(value || "").toLowerCase() === "dollars" ? "dollars" : "shares";
+  }
+
+  function getUiActiveElement(wrap) {
+    try {
+      const root = wrap?.getRootNode?.();
+      if (root && root.activeElement) return root.activeElement;
+    } catch {
+      // ignore
+    }
+    return document.activeElement;
+  }
+
+  function applyQtyInputMode(input, mode) {
+    if (!input) return;
+    if (mode === "dollars") {
+      input.min = "0.01";
+      input.step = "0.01";
+    } else {
+      input.min = "1";
+      input.step = "1";
+    }
+  }
+
   function applyTradeUi(ui, cfg) {
     const wrap = ui.wrap;
     const orderType = normalizeOrderType(cfg.orderType);
@@ -1115,11 +1154,20 @@
       if (val === orderType) btn.classList.add("active");
       else btn.classList.remove("active");
     });
+    const buyQtyMode = normalizeBuyQtyMode(cfg.buyQtyMode);
+    const modeButtons = wrap.querySelectorAll(".qty-mode .toggle-btn");
+    modeButtons.forEach((btn) => {
+      const val = normalizeBuyQtyMode(btn.getAttribute("data-value"));
+      if (val === buyQtyMode) btn.classList.add("active");
+      else btn.classList.remove("active");
+    });
     const qtyInput = wrap.querySelector(".qty-input");
     const limitInput = wrap.querySelector(".limit-input");
-    if (qtyInput) qtyInput.value = String(cfg.buyQty ?? 1);
+    const activeEl = getUiActiveElement(wrap);
+    applyQtyInputMode(qtyInput, buyQtyMode);
+    if (qtyInput && activeEl !== qtyInput) qtyInput.value = String(cfg.buyQty ?? 1);
     const offsetVal = cfg.limitOffset ?? cfg.limitPrice ?? "";
-    if (limitInput) limitInput.value = String(offsetVal);
+    if (limitInput && activeEl !== limitInput) limitInput.value = String(offsetVal);
     const limitWrap = wrap.querySelector(".limit-only");
     if (limitWrap) limitWrap.style.display = orderType === "limit" ? "" : "none";
   }
@@ -1128,12 +1176,20 @@
     const wrap = ui.wrap;
     const activeBtn = wrap.querySelector(".order-type .toggle-btn.active");
     const orderType = normalizeOrderType(activeBtn?.getAttribute("data-value"));
+    const modeBtn = wrap.querySelector(".qty-mode .toggle-btn.active");
+    const buyQtyMode = normalizeBuyQtyMode(modeBtn?.getAttribute("data-value"));
     const qtyInput = wrap.querySelector(".qty-input");
     const limitInput = wrap.querySelector(".limit-input");
-    const buyQty = Math.max(1, Number(qtyInput?.value || 1));
+    let buyQtyRaw = Number(qtyInput?.value || 1);
+    if (!Number.isFinite(buyQtyRaw)) buyQtyRaw = 1;
+    const buyQty =
+      buyQtyMode === "dollars"
+        ? Math.max(0.01, Math.round(buyQtyRaw * 100) / 100)
+        : Math.max(1, Math.floor(buyQtyRaw));
     const limitOffset = String(limitInput?.value || "").trim();
-    chrome.storage.local.set({ orderType, buyQty, limitOffset });
+    chrome.storage.local.set({ orderType, buyQtyMode, buyQty, limitOffset });
     currentCfg.orderType = orderType;
+    currentCfg.buyQtyMode = buyQtyMode;
     currentCfg.buyQty = buyQty;
     currentCfg.limitOffset = limitOffset;
     applyTradeUi(ui, currentCfg);
@@ -1301,8 +1357,11 @@
       setStatus(ui, "ok", "live");
       return;
     }
-    const orderType = normalizeOrderType(currentCfg.orderType);
-    const limitOffset = String(currentCfg.limitOffset || currentCfg.limitPrice || "").trim();
+    const wrap = ui.wrap;
+    const activeOrderBtn = wrap.querySelector(".order-type .toggle-btn.active");
+    const orderType = normalizeOrderType(activeOrderBtn?.getAttribute("data-value") || currentCfg.orderType);
+    const limitInput = wrap.querySelector(".limit-input");
+    const limitOffset = String(limitInput?.value || currentCfg.limitOffset || currentCfg.limitPrice || "").trim();
     if (orderType === "limit" && !limitOffset) {
       setStatus(ui, "warn", "offset needed");
       setTradeStatus(ui, "warn", "offset needed");
@@ -1311,7 +1370,29 @@
       return;
     }
     const payload = { symbol, order_type: orderType, limit_offset: limitOffset || null };
-    if (side === "buy") payload.qty = Number(currentCfg.buyQty || 1);
+    if (side === "buy") {
+      const activeModeBtn = wrap.querySelector(".qty-mode .toggle-btn.active");
+      const buyQtyMode = normalizeBuyQtyMode(activeModeBtn?.getAttribute("data-value") || currentCfg.buyQtyMode);
+      const qtyInput = wrap.querySelector(".qty-input");
+      const raw = Number(qtyInput?.value || currentCfg.buyQty || 1);
+      if (buyQtyMode === "dollars") {
+        const amountUsd = Math.round((Number.isFinite(raw) ? raw : 0) * 100) / 100;
+        if (amountUsd <= 0) {
+          setTradeStatus(ui, "warn", "buy amount needed");
+          await sleep(800);
+          return;
+        }
+        payload.amount_usd = amountUsd;
+      } else {
+        const qty = Math.floor(Number.isFinite(raw) ? raw : 0);
+        if (qty <= 0) {
+          setTradeStatus(ui, "warn", "buy qty needed");
+          await sleep(800);
+          return;
+        }
+        payload.qty = qty;
+      }
+    }
 
     try {
       setTradeStatus(ui, "connecting", `${side} submitting`);
@@ -1322,13 +1403,25 @@
         body: JSON.stringify(payload)
       });
       if (!res.ok) {
-        const err = await res.text();
-        setStatus(ui, "err", `${side} failed`);
-        setTradeStatus(ui, "err", `${side} failed`);
-        console.warn("[RHWidget] trade error", err);
+        const errText = await res.text();
+        let detail = "";
+        try {
+          const parsed = JSON.parse(errText);
+          detail = String(parsed?.detail || parsed?.error || "").trim();
+        } catch {
+          detail = "";
+        }
+        const msg = detail ? `${side} failed: ${detail}` : `${side} failed`;
+        setStatus(ui, "err", msg);
+        setTradeStatus(ui, "err", msg);
+        console.warn("[RHWidget] trade error", errText);
       } else {
-        setStatus(ui, "ok", `${side} sent ${symbol}`);
-        setTradeStatus(ui, "ok", `${side} sent ${symbol}`);
+        const data = await res.json().catch(() => null);
+        const order = data?.order || data?.result || null;
+        const state = String(order?.state || "").trim();
+        const msg = state ? `${side} ${state} ${symbol}` : `${side} sent ${symbol}`;
+        setStatus(ui, "ok", msg);
+        setTradeStatus(ui, "ok", msg);
       }
     } catch {
       setStatus(ui, "err", "trade failed");
