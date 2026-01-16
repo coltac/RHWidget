@@ -727,6 +727,17 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
             max_wait_s = 12.0
         max_wait_s = min(max(max_wait_s, 1.0), 120.0)
 
+        def _describe_reject(info: Any) -> str:
+            if not isinstance(info, dict):
+                return "unknown_reject"
+            reject = info.get("reject_reason")
+            if isinstance(reject, str) and reject.strip():
+                return reject.strip()
+            detail = _order_error_detail(info)
+            if detail:
+                return detail
+            return "unknown_reject"
+
         started = time.monotonic()
         while time.monotonic() - started < max_wait_s:
             pos_qty = await asyncio.to_thread(get_position_qty, symbol)
@@ -735,16 +746,44 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
             qty_to_protect = min(intended_qty, qty_available)
             if qty_to_protect > 0:
                 print(f"[trade] placing stop {symbol} qty={qty_to_protect} stop={stop_price}")
-                result = await asyncio.to_thread(
-                    rh.orders.order_sell_stop_loss,
-                    symbol,
-                    qty_to_protect,
-                    stop_price,
-                    None,
-                    "gfd",
-                )
-                order = await _refresh_stock_order(_require_order_ok(result))
-                print(f"[trade] stop placed {symbol} id={order.get('id') or '-'} state={order.get('state') or '-'}")
+
+                # Stop orders generally behave best as GTC. If Robinhood rejects the TIF, retry with GFD once.
+                for tif in ("gtc", "gfd"):
+                    result = await asyncio.to_thread(
+                        rh.orders.order_sell_stop_loss,
+                        symbol,
+                        qty_to_protect,
+                        stop_price,
+                        None,
+                        tif,
+                    )
+                    order = await _refresh_stock_order(_require_order_ok(result))
+                    order_id = order.get("id") or "-"
+                    state = order.get("state") or "-"
+
+                    info: Any = None
+                    try:
+                        if order.get("id"):
+                            info = await asyncio.to_thread(rh.orders.get_stock_order_info, order["id"])
+                    except Exception:
+                        info = None
+
+                    final_state = state
+                    try:
+                        if isinstance(info, dict) and isinstance(info.get("state"), str) and info.get("state"):
+                            final_state = info.get("state")
+                    except Exception:
+                        final_state = state
+
+                    if str(final_state) in {"rejected", "failed", "canceled"}:
+                        reason = _describe_reject(info)
+                        print(f"[trade] stop rejected {symbol} id={order_id} tif={tif} reason={reason}")
+                        if "good til" in reason.lower() or "time_in_force" in reason.lower() or "tif" in reason.lower():
+                            continue
+                        return
+
+                    print(f"[trade] stop placed {symbol} id={order_id} state={final_state} tif={tif}")
+                    return
                 return
             await asyncio.sleep(0.5)
         print(f"[trade] stop not placed {symbol} (timeout waiting for fill)")
