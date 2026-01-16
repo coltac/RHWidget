@@ -13,6 +13,9 @@
     activeSymbolRegion: null,
     widgetPos: null,
     widgetSize: null,
+    newsVisible: false,
+    newsPos: null,
+    newsSize: null,
     orderType: "market",
     buyQtyMode: "dollars",
     buyQty: 1,
@@ -814,6 +817,7 @@
         <div class="right">
           <button class="icon-btn bind-btn" title="Bind symbol input" type="button">B</button>
           <button class="icon-btn train-btn" title="Train active-symbol region" type="button">T</button>
+          <button class="icon-btn news-btn" title="News" type="button">N</button>
           <button class="icon-btn settings-btn" title="Settings" type="button">⚙</button>
           <button class="login-btn" title="Login to Robinhood" type="button">Login</button>
                   </div>
@@ -868,8 +872,26 @@
       <div class="resizer" title="Resize"></div>
     `;
 
+    const newsWrap = document.createElement("div");
+    newsWrap.className = "rh-news-widget hidden";
+    newsWrap.innerHTML = `
+      <div class="news-header">
+        <div class="news-title">News: <span class="news-symbol">-</span></div>
+        <div class="news-actions">
+          <button class="icon-btn news-refresh-btn" title="Refresh" type="button">R</button>
+          <button class="icon-btn news-close-btn" title="Close" type="button">×</button>
+        </div>
+      </div>
+      <div class="news-body">
+        <div class="news-status">select a ticker…</div>
+        <div class="news-list"></div>
+      </div>
+      <div class="news-resizer" title="Resize"></div>
+    `;
+
     shadow.appendChild(style);
     shadow.appendChild(wrap);
+    shadow.appendChild(newsWrap);
 
     fetch(cssUrl)
       .then((r) => r.text())
@@ -886,6 +908,29 @@
       e.stopPropagation();
       e.stopImmediatePropagation?.();
       if (chrome?.runtime?.openOptionsPage) chrome.runtime.openOptionsPage();
+    });
+
+    const newsBtn = wrap.querySelector(".news-btn");
+    const newsCloseBtn = newsWrap.querySelector(".news-close-btn");
+    const newsRefreshBtn = newsWrap.querySelector(".news-refresh-btn");
+    newsBtn?.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setNewsVisible({ newsWrap }, newsWrap.classList.contains("hidden"));
+    });
+    newsCloseBtn?.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setNewsVisible({ newsWrap }, false);
+    });
+    newsRefreshBtn?.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      try {
+        window.dispatchEvent(new Event("rhwidget:news-refresh"));
+      } catch {
+        // ignore
+      }
     });
 
     const loginBtn = wrap.querySelector(".login-btn");
@@ -988,6 +1033,8 @@
 
     const header = wrap.querySelector(".header");
     const resizer = wrap.querySelector(".resizer");
+    const newsHeader = newsWrap.querySelector(".news-header");
+    const newsResizer = newsWrap.querySelector(".news-resizer");
 
     const startDrag = (downEvent) => {
       if (downEvent.button !== 0) return;
@@ -1061,9 +1108,87 @@
     header.addEventListener("mousedown", startDrag);
     resizer.addEventListener("mousedown", startResize);
 
+    const startNewsDrag = (downEvent) => {
+      if (downEvent.button !== 0) return;
+      if (downEvent.target?.closest?.("button,a,input,select,textarea")) return;
+      downEvent.preventDefault();
+      downEvent.stopPropagation();
+
+      newsWrap.dataset.interacting = "1";
+      const rect = newsWrap.getBoundingClientRect();
+      const startX = downEvent.clientX;
+      const startY = downEvent.clientY;
+      const offsetX = startX - rect.left;
+      const offsetY = startY - rect.top;
+
+      newsWrap.style.right = "auto";
+      newsWrap.style.left = `${rect.left}px`;
+      newsWrap.style.top = `${rect.top}px`;
+
+      const onMove = (moveEvent) => {
+        const x = Math.min(
+          Math.max(0, moveEvent.clientX - offsetX),
+          Math.max(0, window.innerWidth - rect.width)
+        );
+        const y = Math.min(
+          Math.max(0, moveEvent.clientY - offsetY),
+          Math.max(0, window.innerHeight - rect.height)
+        );
+        newsWrap.style.left = `${x}px`;
+        newsWrap.style.top = `${y}px`;
+      };
+
+      const onUp = () => {
+        window.removeEventListener("mousemove", onMove, true);
+        window.removeEventListener("mouseup", onUp, true);
+        delete newsWrap.dataset.interacting;
+        saveNewsLayout({ newsWrap });
+      };
+
+      window.addEventListener("mousemove", onMove, true);
+      window.addEventListener("mouseup", onUp, true);
+    };
+
+    const startNewsResize = (downEvent) => {
+      if (downEvent.button !== 0) return;
+      downEvent.preventDefault();
+      downEvent.stopPropagation();
+
+      newsWrap.dataset.interacting = "1";
+      const rect = newsWrap.getBoundingClientRect();
+      const startX = downEvent.clientX;
+      const startY = downEvent.clientY;
+      const startW = rect.width;
+      const startH = rect.height;
+
+      const onMove = (moveEvent) => {
+        const dx = moveEvent.clientX - startX;
+        const dy = moveEvent.clientY - startY;
+        const w = Math.min(Math.max(260, startW + dx), window.innerWidth - rect.left - 8);
+        const h = Math.min(Math.max(180, startH + dy), window.innerHeight - rect.top - 8);
+        newsWrap.style.width = `${w}px`;
+        newsWrap.style.height = `${h}px`;
+      };
+
+      const onUp = () => {
+        window.removeEventListener("mousemove", onMove, true);
+        window.removeEventListener("mouseup", onUp, true);
+        delete newsWrap.dataset.interacting;
+        saveNewsLayout({ newsWrap });
+      };
+
+      window.addEventListener("mousemove", onMove, true);
+      window.addEventListener("mouseup", onUp, true);
+    };
+
+    newsHeader?.addEventListener("mousedown", startNewsDrag);
+    newsResizer?.addEventListener("mousedown", startNewsResize);
+
+    applyNewsLayout({ wrap, newsWrap }, currentCfg);
+
     const mount = document.body || document.documentElement;
     mount.appendChild(root);
-    return { root, shadow, wrap };
+    return { root, shadow, wrap, newsWrap };
   }
 
   function setVisible(ui, visible) {
@@ -1114,6 +1239,65 @@
     chrome.storage.local.set({ widgetPos: pos, widgetSize: size });
     currentCfg.widgetPos = pos;
     currentCfg.widgetSize = size;
+  }
+
+  function applyNewsLayout(ui, cfg) {
+    const wrap = ui.newsWrap;
+    if (!wrap) return;
+    if (wrap.dataset?.interacting === "1") return;
+
+    const pos = cfg?.newsPos;
+    const size = cfg?.newsSize;
+
+    if (pos && Number.isFinite(pos.left) && Number.isFinite(pos.top)) {
+      wrap.style.right = "auto";
+      wrap.style.left = `${Math.max(0, Math.round(pos.left))}px`;
+      wrap.style.top = `${Math.max(0, Math.round(pos.top))}px`;
+    } else if (wrap.dataset?.defaultPlaced !== "1") {
+      try {
+        const mainRect = ui.wrap.getBoundingClientRect();
+        wrap.style.right = "auto";
+        wrap.style.left = `${Math.max(0, Math.round(mainRect.left))}px`;
+        wrap.style.top = `${Math.max(0, Math.round(mainRect.top + mainRect.height + 12))}px`;
+      } catch {
+        // ignore
+      }
+      wrap.dataset.defaultPlaced = "1";
+    }
+
+    if (size && Number.isFinite(size.width) && Number.isFinite(size.height)) {
+      wrap.style.width = `${Math.max(260, Math.round(size.width))}px`;
+      wrap.style.height = `${Math.max(180, Math.round(size.height))}px`;
+    } else if (wrap.dataset?.defaultSized !== "1") {
+      wrap.style.width = "420px";
+      wrap.style.height = "320px";
+      wrap.dataset.defaultSized = "1";
+    }
+  }
+
+  function saveNewsLayout(ui) {
+    const wrap = ui.newsWrap;
+    if (!wrap) return;
+    const rect = wrap.getBoundingClientRect();
+    const pos = { left: Math.round(rect.left), top: Math.round(rect.top) };
+    const size = { width: Math.round(rect.width), height: Math.round(rect.height) };
+    chrome.storage.local.set({ newsPos: pos, newsSize: size });
+    currentCfg.newsPos = pos;
+    currentCfg.newsSize = size;
+  }
+
+  function setNewsVisible(ui, visible) {
+    const wrap = ui.newsWrap;
+    if (!wrap) return;
+    wrap.classList.toggle("hidden", !visible);
+    chrome.storage.local.set({ newsVisible: !!visible });
+    currentCfg.newsVisible = !!visible;
+  }
+
+  function applyNewsVisible(ui, visible) {
+    const wrap = ui.newsWrap;
+    if (!wrap) return;
+    wrap.classList.toggle("hidden", !visible);
   }
 
   function normalizeOrderType(value) {
@@ -1493,11 +1677,127 @@
     }
   }
 
+  function renderNews(ui, symbol, payload) {
+    const wrap = ui.newsWrap;
+    if (!wrap) return;
+    const symEl = wrap.querySelector(".news-symbol");
+    const statusEl = wrap.querySelector(".news-status");
+    const listEl = wrap.querySelector(".news-list");
+    if (symEl) symEl.textContent = symbol || "-";
+    if (!statusEl || !listEl) return;
+
+    const ok = !!payload?.ok;
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+    const err = String(payload?.error || payload?.detail || "").trim();
+
+    listEl.textContent = "";
+    if (!symbol || symbol === "-" || symbol === "—") {
+      statusEl.textContent = "select a ticker…";
+      return;
+    }
+    if (!ok) {
+      statusEl.textContent = err ? `error: ${err}` : "error loading news";
+      return;
+    }
+    if (!items.length) {
+      statusEl.textContent = "no headlines";
+      return;
+    }
+    statusEl.textContent = "";
+    for (const item of items.slice(0, 20)) {
+      const title = String(item?.title || "").trim();
+      const link = String(item?.link || "").trim();
+      const source = String(item?.source || "").trim();
+      const pub = String(item?.pub_date || "").trim();
+      if (!title || !link) continue;
+
+      const row = document.createElement("div");
+      row.className = "news-item";
+
+      const a = document.createElement("a");
+      a.className = "news-link";
+      a.href = link;
+      a.target = "_blank";
+      a.rel = "noreferrer noopener";
+      a.textContent = title;
+      row.appendChild(a);
+
+      const meta = [source, pub].filter(Boolean).join(" · ");
+      if (meta) {
+        const metaEl = document.createElement("div");
+        metaEl.className = "news-meta";
+        metaEl.textContent = meta;
+        row.appendChild(metaEl);
+      }
+
+      listEl.appendChild(row);
+    }
+  }
+
+  async function newsLoop(ui) {
+    let prevSymbol = "";
+    let lastFetchMs = 0;
+    let forceRefresh = false;
+    let inFlight = false;
+
+    window.addEventListener("rhwidget:news-refresh", () => {
+      forceRefresh = true;
+    });
+
+    while (true) {
+      const visible = !!currentCfg.newsVisible && isLegendRoute() && !ui.newsWrap?.classList.contains("hidden");
+      if (!visible) {
+        await sleep(700);
+        continue;
+      }
+
+      const symbol = detectActiveSymbol(ui) || "";
+      const now = Date.now();
+      const shouldFetch =
+        forceRefresh || (symbol && symbol !== prevSymbol) || (symbol && now - lastFetchMs > 45_000);
+
+      if (!symbol) {
+        renderNews(ui, "-", { ok: true, items: [] });
+        prevSymbol = "";
+        await sleep(700);
+        continue;
+      }
+
+      if (shouldFetch && !inFlight) {
+        forceRefresh = false;
+        prevSymbol = symbol;
+        lastFetchMs = now;
+        inFlight = true;
+        const statusEl = ui.newsWrap?.querySelector?.(".news-status");
+        if (statusEl) statusEl.textContent = "loading…";
+        const url = `${currentCfg.apiBase.replace(/\/$/, "")}/api/news?symbol=${encodeURIComponent(symbol)}`;
+        try {
+          const res = await fetch(url, { cache: "no-store" });
+          const data = await res.json().catch(() => null);
+          if (!res.ok) {
+            const detail = String(data?.detail || data?.error || "request_failed").trim();
+            renderNews(ui, symbol, { ok: false, items: [], error: detail });
+          } else {
+            renderNews(ui, symbol, data);
+          }
+        } catch {
+          renderNews(ui, symbol, { ok: false, items: [], error: "bridge/news offline" });
+        } finally {
+          inFlight = false;
+        }
+      }
+
+      await sleep(650);
+    }
+  }
+
   async function initConfig(ui) {
     const cfg = await loadConfig();
     currentCfg = { ...DEFAULTS, ...cfg };
     applyWidgetLayout(ui, currentCfg);
     applyTradeUi(ui, currentCfg);
+    applyNewsLayout(ui, currentCfg);
+    applyNewsVisible(ui, !!currentCfg.newsVisible);
   }
 
   async function pollLoop(ui) {
@@ -1510,6 +1810,8 @@
       const cfg = await loadConfig();
       currentCfg = { ...DEFAULTS, ...cfg };
       applyTradeUi(ui, currentCfg);
+      applyNewsLayout(ui, currentCfg);
+      applyNewsVisible(ui, !!currentCfg.newsVisible);
       if (!currentCfg.symbolClickSelector && cfg.symbolSelector) currentCfg.symbolClickSelector = cfg.symbolSelector;
       if (!currentCfg.symbolTypeSelector && cfg.symbolSelector) currentCfg.symbolTypeSelector = cfg.symbolSelector;
       const url = `${cfg.apiBase.replace(/\/$/, "")}/api/tickers`;
@@ -1534,5 +1836,6 @@
   installHotkeys(ui);
   activeSymbolLoop(ui);
   authLoop(ui);
+  newsLoop(ui);
   pollLoop(ui);
 })();

@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import math
 import os
 import pickle
 import time
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -99,6 +103,9 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
         "login_payload": None,
         "prompt_validated": False,
     }
+
+    news_lock = asyncio.Lock()
+    news_cache: dict[str, dict[str, Any]] = {}
 
     def build_login_payload(device_token: str) -> dict[str, Any]:
         return {
@@ -353,6 +360,37 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
             return None
         return None
 
+    def fetch_news(symbol: str, limit: int = 12) -> list[dict[str, Any]]:
+        query = f"{symbol} stock"
+        url = (
+            "https://news.google.com/rss/search?q="
+            + urllib.parse.quote_plus(query)
+            + "&hl=en-US&gl=US&ceid=US:en"
+        )
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (RHWidget) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = resp.read()
+        root = ET.fromstring(data)
+        channel = root.find("channel")
+        if channel is None:
+            return []
+        items: list[dict[str, Any]] = []
+        for item in list(channel.findall("item"))[: max(1, min(50, int(limit))) ]:
+            title = html.unescape((item.findtext("title") or "").strip())
+            link = (item.findtext("link") or "").strip()
+            pub_date = (item.findtext("pubDate") or "").strip()
+            source_el = item.find("source")
+            source = html.unescape((source_el.text or "").strip()) if source_el is not None else ""
+            if not title or not link:
+                continue
+            items.append({"title": title, "link": link, "pub_date": pub_date, "source": source})
+        return items
+
     def get_position_qty(symbol: str) -> float:
         try:
             instruments = rh.stocks.get_instruments_by_symbols(symbol) or []
@@ -438,6 +476,34 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
     @app.get("/api/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/api/news")
+    async def news(symbol: str = Query(...), limit: int = Query(12, ge=1, le=50)) -> JSONResponse:
+        sym = (symbol or "").strip().upper()
+        if not sym or sym in {"-", "—"}:
+            raise HTTPException(status_code=400, detail="missing_symbol")
+
+        now = time.monotonic()
+        async with news_lock:
+            cached = news_cache.get(sym)
+            if cached and isinstance(cached.get("ts"), (int, float)) and now - float(cached["ts"]) < 45:
+                return JSONResponse(
+                    {"ok": True, "symbol": sym, "items": cached.get("items") or [], "cached": True},
+                    headers={"Cache-Control": "no-store"},
+                )
+
+        try:
+            items = await asyncio.to_thread(fetch_news, sym, limit)
+        except Exception as exc:
+            return JSONResponse(
+                {"ok": False, "symbol": sym, "items": [], "error": repr(exc)},
+                status_code=502,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        async with news_lock:
+            news_cache[sym] = {"ts": now, "items": items}
+        return JSONResponse({"ok": True, "symbol": sym, "items": items, "cached": False}, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/auth/status")
     async def auth_status() -> JSONResponse:

@@ -52,6 +52,7 @@ The widget header has two small training buttons:
 
 - **B (Bind symbol input):** click this, then click the Legend symbol/search input. This teaches the widget where to click and type when you click a ticker.
 - **T (Train active symbol):** click this, then drag a box around the on-screen symbol/ticker that represents the current active chart. This lets hotkeys (buy/sell) know which symbol is active.
+- **N (News):** toggles a detachable news panel for the active ticker (drag/resize; position is saved).
 
 Press `Esc` to cancel a training mode.
 

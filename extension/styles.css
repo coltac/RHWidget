@@ -2,6 +2,10 @@
   all: initial;
 }
 
+.hidden {
+  display: none !important;
+}
+
 .rh-momo-widget {
   position: fixed;
   top: 84px;
@@ -20,6 +24,101 @@
   overflow: hidden;
   display: flex;
   flex-direction: column;
+}
+
+.rh-news-widget {
+  position: fixed;
+  top: 120px;
+  right: 16px;
+  width: 420px;
+  height: 320px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 120px);
+  background: rgba(16, 20, 33, 0.92);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 12px;
+  backdrop-filter: blur(10px);
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+  z-index: 2147483647;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.news-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px 8px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.10);
+  background: rgba(22, 27, 44, 0.9);
+  cursor: move;
+  user-select: none;
+}
+
+.news-title {
+  font-size: 12px;
+  font-weight: 650;
+  opacity: 0.95;
+}
+
+.news-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.news-body {
+  padding: 10px 12px;
+  overflow: auto;
+  flex: 1;
+}
+
+.news-status {
+  font-size: 12px;
+  color: #9fb0c7;
+  margin-bottom: 8px;
+}
+
+.news-item {
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.news-link {
+  color: #93c5fd;
+  text-decoration: underline;
+  font-weight: 650;
+  display: inline-block;
+}
+
+.news-meta {
+  margin-top: 4px;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.75);
+}
+
+.news-resizer {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 18px;
+  height: 18px;
+  cursor: nwse-resize;
+  background: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0) 45%,
+    rgba(255, 255, 255, 0.25) 46%,
+    rgba(255, 255, 255, 0.25) 65%,
+    rgba(255, 255, 255, 0) 66%
+  );
+  border-radius: 4px;
+  opacity: 0.7;
+}
+
+.news-resizer:hover {
+  opacity: 0.95;
 }
 
 .header {
@@ -345,4 +444,3 @@ table.table td[data-signed="zero"] {
 .status-inline .text {
   display: none;
 }
-
