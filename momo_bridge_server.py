@@ -586,18 +586,12 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
 
     def _auto_stop_config(payload: BuyRequest) -> dict[str, Any]:
         enabled = payload.auto_stop if payload.auto_stop is not None else _env_bool("AUTO_STOP_ENABLED", False)
-        interval = _env_str("AUTO_STOP_INTERVAL", "1minute")
-        span = _env_str("AUTO_STOP_SPAN", "day")
-        bounds = _env_str("AUTO_STOP_BOUNDS", "regular")
         offset = _env_float("AUTO_STOP_OFFSET", 0.01)
         max_wait_s = _env_float("AUTO_STOP_MAX_WAIT_S", 12.0)
         alpaca_feed = _env_str("ALPACA_DATA_FEED", "iex")
         alpaca_data_base = _env_str("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets/v2")
         return {
             "enabled": bool(enabled),
-            "interval": interval,
-            "span": span,
-            "bounds": bounds,
             "offset": offset,
             "max_wait_s": max_wait_s,
             "alpaca_feed": alpaca_feed,
@@ -951,6 +945,8 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
         before_qty = await asyncio.to_thread(get_position_qty, symbol)
         order_type = normalize_order_type(payload.order_type)
         auto_stop_cfg = _auto_stop_config(payload)
+        if auto_stop_cfg.get("enabled") and payload.stop_price is None and payload.stop_ref_price is None:
+            raise HTTPException(status_code=400, detail="missing_stop_ref_price")
         stop_info: dict[str, Any] | None = None
 
         if payload.amount_usd is not None:
@@ -1034,7 +1030,7 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
                 explicit_stop = float(payload.stop_price) if payload.stop_price is not None else None
                 ref_price = float(payload.stop_ref_price) if payload.stop_ref_price is not None else None
 
-                source = "candle"
+                source = "cursor"
                 if explicit_stop is not None:
                     stop_price = round_price(explicit_stop)
                     source = "explicit"
@@ -1042,18 +1038,8 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
                     stop_price = round_price(ref_price - offset)
                     source = "cursor"
                 else:
-                    prev_low = await asyncio.to_thread(
-                        get_prev_candle_low,
-                        symbol,
-                        str(auto_stop_cfg.get("interval") or ""),
-                        str(auto_stop_cfg.get("span") or ""),
-                        str(auto_stop_cfg.get("bounds") or ""),
-                    )
-                    if prev_low is None:
-                        stop_info = {"enabled": True, "status": "error", "error": "candle_unavailable"}
-                        stop_price = None
-                    else:
-                        stop_price = round_price(float(prev_low) - offset)
+                    stop_info = {"enabled": True, "status": "error", "error": "missing_stop_ref_price"}
+                    stop_price = None
 
                 if stop_price is None:
                     pass
@@ -1065,7 +1051,6 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
                         "status": "pending",
                         "stop_price": float(stop_price),
                         "source": source,
-                        "interval": auto_stop_cfg.get("interval"),
                         "offset": offset,
                         "ref_price": ref_price if source == "cursor" else None,
                     }

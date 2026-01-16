@@ -1391,7 +1391,7 @@
           <button class="toggle-btn" data-value="limit" type="button">LMT</button>
         </div>
         <div class="toggle-group auto-stop">
-          <button class="toggle-btn auto-stop-btn" type="button" title="Auto stop-loss: 1¢ below previous candle low">STOP</button>
+          <button class="toggle-btn auto-stop-btn" type="button" title="Auto stop-loss: (Cursor Price - offset) — default offset 1¢">STOP</button>
         </div>
         <div class="field">
           <label>Buy</label>
@@ -2156,7 +2156,12 @@
       payload.auto_stop = !!autoStopBtn?.classList?.contains("active");
       if (payload.auto_stop) {
         const cursorPrice = detectCursorPrice(ui);
-        if (cursorPrice != null) payload.stop_ref_price = cursorPrice;
+        if (cursorPrice == null) {
+          setTradeStatus(ui, "warn", "cursor price missing (STOP on)");
+          await sleep(900);
+          return;
+        }
+        payload.stop_ref_price = cursorPrice;
       }
       const activeModeBtn = wrap.querySelector(".qty-mode .toggle-btn.active");
       const buyQtyMode = normalizeBuyQtyMode(activeModeBtn?.getAttribute("data-value") || currentCfg.buyQtyMode);
