@@ -205,6 +205,17 @@
   white-space: nowrap;
 }
 
+.cursor-price-wrap {
+  margin-left: 10px;
+  opacity: 0.9;
+}
+
+.cursor-price {
+  color: #fff;
+  font-weight: 750;
+  letter-spacing: 0.2px;
+}
+
 .active-symbol {
   font-weight: 750;
   letter-spacing: 0.3px;

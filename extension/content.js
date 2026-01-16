@@ -969,17 +969,77 @@
       const yCenter = rect.top + rect.height / 2;
       const yDist = Math.abs(yCenter - yBase);
 
-      const score = overlap * 100 + luma * 40 + (hasBg ? 25 : 0) - rectArea / 4000 - yDist / 10;
+      if (yDist > 40) continue;
+      const minRgb01 = fg ? Math.min(fg.r, fg.g, fg.b) / 255 : 0;
+      const redBias = fg ? fg.r / 255 - (fg.g + fg.b) / (2 * 255) : 0;
+
+      const score =
+        overlap * 120 +
+        minRgb01 * 140 +
+        luma * 20 +
+        (hasBg ? 35 : 0) -
+        Math.max(0, redBias) * 220 -
+        rectArea / 4000 -
+        yDist / 8;
       if (!best || score > best.score) best = { price, score };
     }
 
     return best?.price ?? null;
   }
 
+  function setCursorPrice(ui, price) {
+    const el = ui.wrap.querySelector(".cursor-price");
+    if (!el) return;
+    if (price == null) {
+      el.textContent = "-";
+      return;
+    }
+    const n = Number(price);
+    if (!Number.isFinite(n) || n <= 0) {
+      el.textContent = "-";
+      return;
+    }
+    el.textContent = n.toFixed(2);
+  }
+
+  async function cursorPriceLoop(ui) {
+    let lastGood = null;
+    let lastGoodTs = 0;
+    while (true) {
+      if (!isLegendRoute()) {
+        setCursorPrice(ui, null);
+        lastGood = null;
+        lastGoodTs = 0;
+        await sleep(800);
+        continue;
+      }
+      if (!currentCfg.cursorPriceAxisRegion) {
+        setCursorPrice(ui, null);
+        lastGood = null;
+        lastGoodTs = 0;
+        await sleep(600);
+        continue;
+      }
+      const price = detectCursorPrice(ui);
+      const now = Date.now();
+      if (price != null && price !== lastGood) {
+        lastGood = price;
+        lastGoodTs = now;
+        setCursorPrice(ui, price);
+      } else if (price != null) {
+        lastGoodTs = now;
+      } else if (lastGood != null && now - lastGoodTs > 1500) {
+        lastGood = null;
+        setCursorPrice(ui, null);
+      }
+      await sleep(120);
+    }
+  }
+
   function setActiveSymbol(ui, symbol) {
     const el = ui.wrap.querySelector(".active-symbol");
     if (!el) return;
-    el.textContent = symbol || "—";
+    el.textContent = symbol || "-";
   }
 
   async function activeSymbolLoop(ui) {
@@ -1019,7 +1079,10 @@
     wrap.innerHTML = `
       <div class="header">
         <div class="title">Momo Screener</div>
-        <div class="active">Active: <span class="active-symbol">—</span></div>
+        <div class="active">
+          Active: <span class="active-symbol">-</span>
+          <span class="cursor-price-wrap">Cursor Price: <span class="cursor-price">-</span></span>
+        </div>
         <div class="right">
           <button class="icon-btn bind-btn" title="Bind symbol input" type="button">B</button>
           <button class="icon-btn train-btn" title="Train active-symbol region" type="button">T</button>
@@ -2152,6 +2215,7 @@
   installRouteWatcher(ui);
   installHotkeys(ui);
   activeSymbolLoop(ui);
+  cursorPriceLoop(ui);
   authLoop(ui);
   newsLoop(ui);
   pollLoop(ui);
