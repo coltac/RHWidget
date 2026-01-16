@@ -3,13 +3,16 @@
   "name": "RHWidget (Momo Screener)",
   "version": "0.2.2",
   "description": "Shows Momoscreener tickers on Robinhood Legend and lets you click to activate a symbol.",
-  "permissions": ["storage"],
+  "permissions": ["storage", "scripting"],
   "host_permissions": [
     "*://robinhood.com/*",
     "*://*.robinhood.com/*",
     "http://127.0.0.1:8787/*",
     "http://localhost:8787/*"
   ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "web_accessible_resources": [
     {
       "resources": ["styles.css"],

@@ -7,6 +7,16 @@
     if (window.__RH_WIDGET_CANVAS_CURSOR__) return;
     window.__RH_WIDGET_CANVAS_CURSOR__ = true;
 
+    function requestBackgroundInject() {
+      try {
+        chrome.runtime.sendMessage({ type: "rhwidget_inject_cursor" }, () => {
+          // ignore response; retries below
+        });
+      } catch {
+        // ignore
+      }
+    }
+
     function inject() {
       try {
         if (!document.documentElement) return;
@@ -176,8 +186,10 @@
     } catch {
       // ignore
     }
+    requestBackgroundInject();
     inject();
     setInterval(inject, 2000);
+    setInterval(requestBackgroundInject, 3000);
   }
 
   installCanvasCursorReader();
