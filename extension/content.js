@@ -11,6 +11,7 @@
     symbolTypeSelector: "",
     activeSymbolPath: [],
     activeSymbolRegion: null,
+    cursorPricePath: [],
     cursorPriceAxisRegion: null,
     widgetPos: null,
     widgetSize: null,
@@ -644,6 +645,58 @@
     document.addEventListener("mouseup", onUp, true);
   }
 
+  async function bindCursorPriceElement(ui) {
+    const overlay = document.createElement("div");
+    overlay.style.cssText =
+      "position:fixed;inset:0;z-index:2147483646;pointer-events:none;" +
+      "background:rgba(0,0,0,.22);display:flex;align-items:flex-start;justify-content:center;padding-top:18px;";
+    const card = document.createElement("div");
+    card.style.cssText =
+      "pointer-events:none;background:rgba(16,20,33,.96);color:#fff;border:1px solid rgba(255,255,255,.18);" +
+      "border-radius:12px;padding:10px 12px;max-width:720px;width:calc(100vw - 40px);font:13px system-ui;";
+    card.textContent =
+      "Bind cursor price: click the white crosshair price label (next to the '+') to bind it. Press Esc to cancel.";
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+
+    const cleanup = () => {
+      overlay.remove();
+      window.removeEventListener("keydown", onKey, true);
+      document.removeEventListener("click", onClick, true);
+    };
+
+    const onKey = async (e) => {
+      if (e.key !== "Escape") return;
+      cleanup();
+      setStatus(ui, "ok", "canceled");
+      await sleep(800);
+      setStatus(ui, "ok", "live");
+    };
+
+    const onClick = async (e) => {
+      if (ui.root.contains(e.target)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation?.();
+
+      const target = e.target instanceof Element ? e.target : null;
+      if (!target) return;
+
+      const path = buildSelectorPath(target);
+      if (!path.length) return;
+
+      await chrome.storage.local.set({ cursorPricePath: path });
+      currentCfg.cursorPricePath = path;
+      cleanup();
+      setStatus(ui, "ok", "cursor bound");
+      await sleep(900);
+      setStatus(ui, "ok", "live");
+    };
+
+    window.addEventListener("keydown", onKey, true);
+    document.addEventListener("click", onClick, true);
+  }
+
   async function activateSymbol(symbol) {
     const s = extractTicker(symbol);
     if (!s) return false;
@@ -929,7 +982,111 @@
     );
   }
 
+  function detectCursorPriceFromScale(regionRect, yBase) {
+    const { left, top, right, bottom } = regionRect;
+    const w = right - left;
+    const h = bottom - top;
+    if (w < 6 || h < 24) return null;
+
+    const xSamples = [
+      left + Math.floor(w * 0.25),
+      left + Math.floor(w * 0.55),
+      left + Math.floor(w * 0.8)
+    ];
+    const yStep = Math.max(10, Math.floor(h / 18));
+
+    const candidates = new Set();
+    for (let y = top + 6; y <= bottom - 6; y += yStep) {
+      for (const x0 of xSamples) {
+        const x = Math.min(Math.max(left, x0), right - 1);
+        try {
+          for (const el of document.elementsFromPoint(x, y)) {
+            if (el instanceof Element) candidates.add(el);
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    const points = [];
+    const seen = new Set();
+    for (const el of candidates) {
+      const raw = elementTextOrValue(el) || el.getAttribute?.("aria-label") || el.getAttribute?.("title") || "";
+      const price = extractPrice(raw);
+      if (price == null) continue;
+
+      let rect;
+      try {
+        rect = el.getBoundingClientRect();
+      } catch {
+        continue;
+      }
+      if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+      const yCenter = rect.top + rect.height / 2;
+      if (yCenter < top - 2 || yCenter > bottom + 2) continue;
+
+      let style;
+      try {
+        style = getComputedStyle(el);
+      } catch {
+        style = null;
+      }
+      const fg = style ? parseRgb(style.color) : null;
+      const bg = style ? parseRgb(style.backgroundColor) : null;
+      const luma = colorLuma01(fg);
+      const channelSpread01 = fg ? (Math.max(fg.r, fg.g, fg.b) - Math.min(fg.r, fg.g, fg.b)) / 255 : 1;
+      const minRgb01 = fg ? Math.min(fg.r, fg.g, fg.b) / 255 : 0;
+      const redBias = fg ? fg.r / 255 - (fg.g + fg.b) / (2 * 255) : 0;
+      const hasBg = bg
+        ? (bg.a ?? 1) > 0.05 && !(bg.r === 0 && bg.g === 0 && bg.b === 0 && (bg.a ?? 1) === 0)
+        : false;
+
+      // Keep mostly-neutral axis labels; exclude white crosshair + colored last price labels.
+      if (hasBg) continue;
+      if (luma > 0.9) continue;
+      if (luma < 0.22) continue;
+      if (minRgb01 > 0.92) continue;
+      if (channelSpread01 > 0.14) continue;
+      if (Math.abs(redBias) > 0.18) continue;
+
+      const key = `${price.toFixed(4)}@${Math.round(yCenter)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      points.push({ y: yCenter, p: price });
+    }
+
+    if (points.length < 3) return null;
+
+    // Least-squares fit: p = a*y + b. Works for linear price scales.
+    const n = points.length;
+    let sumY = 0,
+      sumP = 0,
+      sumYY = 0,
+      sumYP = 0;
+    for (const pt of points) {
+      sumY += pt.y;
+      sumP += pt.p;
+      sumYY += pt.y * pt.y;
+      sumYP += pt.y * pt.p;
+    }
+    const denom = n * sumYY - sumY * sumY;
+    if (Math.abs(denom) < 1e-6) return null;
+    const a = (n * sumYP - sumY * sumP) / denom;
+    const b = (sumP - a * sumY) / n;
+    const out = a * yBase + b;
+    if (!Number.isFinite(out) || out <= 0) return null;
+    return out;
+  }
+
   function detectCursorPrice(ui) {
+    if (Array.isArray(currentCfg.cursorPricePath) && currentCfg.cursorPricePath.length > 0) {
+      const el = queryByPath(currentCfg.cursorPricePath);
+      const raw = elementTextOrValue(el) || el?.getAttribute?.("aria-label") || el?.getAttribute?.("title") || "";
+      const direct = extractPrice(raw);
+      if (direct != null) return direct;
+    }
+
     const region = currentCfg.cursorPriceAxisRegion;
     if (!region || typeof region !== "object") return null;
     if (!lastMousePos) return null;
@@ -963,6 +1120,10 @@
     }
 
     const regionRect = { left: rx, top: ry, right: rx + rw, bottom: ry + rh, area: rw * rh };
+
+    // Try to compute from the axis scale itself (very reliable if labels are DOM).
+    const scaled = detectCursorPriceFromScale(regionRect, yBase);
+    if (scaled != null) return scaled;
 
     // 1) Anchor on the "+" button next to the crosshair price label, then read the adjacent number.
     let bestAnchored = null;
@@ -1168,6 +1329,7 @@
         <div class="right">
           <button class="icon-btn bind-btn" title="Bind symbol input" type="button">B</button>
           <button class="icon-btn train-btn" title="Train active-symbol region" type="button">T</button>
+          <button class="icon-btn cursor-btn" title="Bind cursor price label (click)" type="button">C</button>
           <button class="icon-btn price-btn" title="Train cursor price axis region" type="button">P</button>
           <button class="icon-btn news-btn" title="News" type="button">N</button>
           <button class="icon-btn settings-btn" title="Settings" type="button">⚙</button>
@@ -1341,6 +1503,15 @@
       e.stopImmediatePropagation?.();
       setStatus({ wrap }, "connecting", "train mode");
       await bindActiveSymbol({ root, wrap });
+    });
+
+    const cursorBtn = wrap.querySelector(".cursor-btn");
+    cursorBtn?.addEventListener("click", async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation?.();
+      setStatus({ wrap }, "connecting", "cursor bind");
+      await bindCursorPriceElement({ root, wrap });
     });
 
     const priceBtn = wrap.querySelector(".price-btn");
