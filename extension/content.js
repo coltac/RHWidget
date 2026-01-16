@@ -560,7 +560,9 @@
     card.style.cssText =
       "pointer-events:none;background:rgba(16,20,33,.96);color:#fff;border:1px solid rgba(255,255,255,.18);" +
       "border-radius:12px;padding:10px 12px;max-width:720px;width:calc(100vw - 40px);font:13px system-ui;";
-    card.textContent = "Train cursor price axis: drag-select the y-axis price labels area (press Esc to cancel).";
+    card.textContent =
+      "Train cursor price axis: drag-select the y-axis price labels area (include the floating crosshair label with the '+' icon if possible). " +
+      "Press Esc to cancel.";
     overlay.appendChild(card);
     document.body.appendChild(overlay);
 
@@ -896,6 +898,37 @@
     return 0.2126 * r + 0.7152 * g + 0.0722 * b;
   }
 
+  function scorePriceEl({ el, overlap, yDist, preferWhite }) {
+    let style;
+    try {
+      style = getComputedStyle(el);
+    } catch {
+      style = null;
+    }
+    const fg = style ? parseRgb(style.color) : null;
+    const bg = style ? parseRgb(style.backgroundColor) : null;
+    const luma = colorLuma01(fg);
+    const minRgb01 = fg ? Math.min(fg.r, fg.g, fg.b) / 255 : 0;
+    const redBias = fg ? fg.r / 255 - (fg.g + fg.b) / (2 * 255) : 0;
+    const channelSpread01 = fg ? (Math.max(fg.r, fg.g, fg.b) - Math.min(fg.r, fg.g, fg.b)) / 255 : 1;
+    const hasBg = bg
+      ? (bg.a ?? 1) > 0.05 && !(bg.r === 0 && bg.g === 0 && bg.b === 0 && (bg.a ?? 1) === 0)
+      : false;
+
+    const whiteBonus = preferWhite ? minRgb01 * 180 + (1 - channelSpread01) * 80 : 0;
+    const colorPenalty = preferWhite ? Math.max(0, channelSpread01 - 0.12) * 240 : 0;
+
+    return (
+      overlap * 140 +
+      whiteBonus +
+      luma * 10 +
+      (hasBg ? 45 : 0) -
+      Math.max(0, redBias) * 260 -
+      colorPenalty -
+      yDist / 8
+    );
+  }
+
   function detectCursorPrice(ui) {
     const region = currentCfg.cursorPriceAxisRegion;
     if (!region || typeof region !== "object") return null;
@@ -930,6 +963,76 @@
     }
 
     const regionRect = { left: rx, top: ry, right: rx + rw, bottom: ry + rh, area: rw * rh };
+
+    // 1) Anchor on the "+" button next to the crosshair price label, then read the adjacent number.
+    let bestAnchored = null;
+    for (const plusEl of elements) {
+      if (!(plusEl instanceof Element)) continue;
+      if (ui?.root && ui.root.contains(plusEl)) continue;
+      const plusText = String(elementTextOrValue(plusEl) || "").trim();
+      if (plusText !== "+") continue;
+
+      let plusRect;
+      try {
+        plusRect = plusEl.getBoundingClientRect();
+      } catch {
+        continue;
+      }
+      if (!plusRect || plusRect.width <= 0 || plusRect.height <= 0) continue;
+      const plusCenterY = plusRect.top + plusRect.height / 2;
+      const plusYDist = Math.abs(plusCenterY - yBase);
+      if (plusYDist > 55) continue;
+
+      const sampleXs = [plusRect.right + 6, plusRect.right + 18, plusRect.right + 30];
+      const sampleY = Math.min(Math.max(ry, Math.round(plusCenterY)), ry + rh - 1);
+      let bestPrice = null;
+      for (const sx0 of sampleXs) {
+        const sx = Math.min(Math.max(rx, Math.round(sx0)), rx + rw - 1);
+        let near = [];
+        try {
+          near = document.elementsFromPoint(sx, sampleY);
+        } catch {
+          near = [];
+        }
+        for (const el of near) {
+          if (!(el instanceof Element)) continue;
+          if (ui?.root && ui.root.contains(el)) continue;
+          const raw = elementTextOrValue(el) || el.getAttribute?.("aria-label") || el.getAttribute?.("title") || "";
+          const price = extractPrice(raw);
+          if (price == null) continue;
+          let rect;
+          try {
+            rect = el.getBoundingClientRect();
+          } catch {
+            rect = null;
+          }
+          if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+          const left = Math.max(regionRect.left, rect.left);
+          const top = Math.max(regionRect.top, rect.top);
+          const right = Math.min(regionRect.right, rect.right);
+          const bottom = Math.min(regionRect.bottom, rect.bottom);
+          const iw = right - left;
+          const ih = bottom - top;
+          if (iw <= 0 || ih <= 0) continue;
+          const overlap = (iw * ih) / Math.max(1, regionRect.area);
+          const yCenter = rect.top + rect.height / 2;
+          const yDist = Math.abs(yCenter - yBase);
+          if (yDist > 55) continue;
+
+          const score = scorePriceEl({ el, overlap, yDist, preferWhite: true });
+          if (!bestPrice || score > bestPrice.score) bestPrice = { price, score };
+        }
+      }
+
+      if (bestPrice) {
+        // Prefer the "+" anchor that yields the strongest nearby white price candidate.
+        const score = bestPrice.score - plusYDist / 4;
+        if (!bestAnchored || score > bestAnchored.score) bestAnchored = { price: bestPrice.price, score };
+      }
+    }
+    if (bestAnchored?.price != null) return bestAnchored.price;
+
+    // 2) Fallback: score any price-like element near the cursor Y (less reliable).
     let best = null;
     for (const el of elements) {
       if (!(el instanceof Element)) continue;
@@ -954,33 +1057,12 @@
       const raw = elementTextOrValue(el) || el.getAttribute?.("aria-label") || el.getAttribute?.("title") || "";
       const price = extractPrice(raw);
       if (price == null) continue;
-
-      let style;
-      try {
-        style = getComputedStyle(el);
-      } catch {
-        style = null;
-      }
-      const fg = style ? parseRgb(style.color) : null;
-      const bg = style ? parseRgb(style.backgroundColor) : null;
-      const luma = colorLuma01(fg);
-      const hasBg = bg ? (bg.a ?? 1) > 0.05 && !(bg.r === 0 && bg.g === 0 && bg.b === 0 && (bg.a ?? 1) === 0) : false;
       const rectArea = rect.width * rect.height;
       const yCenter = rect.top + rect.height / 2;
       const yDist = Math.abs(yCenter - yBase);
 
       if (yDist > 40) continue;
-      const minRgb01 = fg ? Math.min(fg.r, fg.g, fg.b) / 255 : 0;
-      const redBias = fg ? fg.r / 255 - (fg.g + fg.b) / (2 * 255) : 0;
-
-      const score =
-        overlap * 120 +
-        minRgb01 * 140 +
-        luma * 20 +
-        (hasBg ? 35 : 0) -
-        Math.max(0, redBias) * 220 -
-        rectArea / 4000 -
-        yDist / 8;
+      const score = scorePriceEl({ el, overlap, yDist, preferWhite: true }) - rectArea / 4000;
       if (!best || score > best.score) best = { price, score };
     }
 
