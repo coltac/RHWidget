@@ -584,11 +584,13 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
 
     def _auto_stop_config(payload: BuyRequest) -> dict[str, Any]:
         enabled = payload.auto_stop if payload.auto_stop is not None else _env_bool("AUTO_STOP_ENABLED", False)
-        interval = _env_str("AUTO_STOP_INTERVAL", "5minute")
+        interval = _env_str("AUTO_STOP_INTERVAL", "1minute")
         span = _env_str("AUTO_STOP_SPAN", "day")
         bounds = _env_str("AUTO_STOP_BOUNDS", "regular")
         offset = _env_float("AUTO_STOP_OFFSET", 0.01)
         max_wait_s = _env_float("AUTO_STOP_MAX_WAIT_S", 12.0)
+        alpaca_feed = _env_str("ALPACA_DATA_FEED", "iex")
+        alpaca_data_base = _env_str("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets/v2")
         return {
             "enabled": bool(enabled),
             "interval": interval,
@@ -596,10 +598,14 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
             "bounds": bounds,
             "offset": offset,
             "max_wait_s": max_wait_s,
+            "alpaca_feed": alpaca_feed,
+            "alpaca_data_base": alpaca_data_base,
         }
 
     def _interval_seconds(interval: str) -> int | None:
         v = (interval or "").strip().lower()
+        if v in {"1minute", "1min", "minute", "1m"}:
+            return 60
         if v == "5minute":
             return 300
         if v == "10minute":
@@ -612,10 +618,77 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
             return 604800
         return None
 
+    def fetch_alpaca_prev_candle_low(symbol: str, feed: str, data_base: str) -> float | None:
+        api_key = (os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID") or "").strip()
+        api_secret = (os.getenv("ALPACA_API_SECRET") or os.getenv("APCA_API_SECRET_KEY") or "").strip()
+        if not api_key or not api_secret:
+            raise RuntimeError("missing_alpaca_credentials")
+
+        base = (data_base or "").strip() or "https://data.alpaca.markets/v2"
+        feed = (feed or "").strip().lower() or "iex"
+        if feed not in {"iex", "sip"}:
+            feed = "iex"
+
+        now = datetime.now(tz=UTC)
+        start = now - timedelta(minutes=15)
+        params = {
+            "timeframe": "1Min",
+            "start": start.isoformat().replace("+00:00", "Z"),
+            "end": now.isoformat().replace("+00:00", "Z"),
+            "limit": "10",
+            "adjustment": "raw",
+            "feed": feed,
+        }
+        url = f"{base.rstrip('/')}/stocks/{urllib.parse.quote(symbol)}/bars?{urllib.parse.urlencode(params)}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "APCA-API-KEY-ID": api_key,
+                "APCA-API-SECRET-KEY": api_secret,
+                "Accept": "application/json",
+                "User-Agent": "RHWidget/0.1 (+local)",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        bars = data.get("bars") if isinstance(data, dict) else None
+        if not isinstance(bars, list) or not bars:
+            return None
+
+        # Alpaca bar timestamps are bar start times. Previous completed bar is the latest bar with t <= now-60s.
+        cutoff = now - timedelta(seconds=60)
+        best_dt: datetime | None = None
+        best_low: float | None = None
+        for b in bars:
+            if not isinstance(b, dict):
+                continue
+            t = _parse_datetime(str(b.get("t") or ""))
+            if not t or t > cutoff:
+                continue
+            low_raw = b.get("l")
+            if low_raw is None:
+                continue
+            try:
+                low = float(low_raw)
+            except Exception:
+                continue
+            if low <= 0:
+                continue
+            if best_dt is None or t > best_dt:
+                best_dt = t
+                best_low = low
+        return best_low
+
     def get_prev_candle_low(symbol: str, interval: str, span: str, bounds: str) -> float | None:
         interval_s = _interval_seconds(interval)
         if not interval_s:
             raise ValueError("invalid_candle_interval")
+        if interval_s == 60:
+            feed = _env_str("ALPACA_DATA_FEED", "iex")
+            data_base = _env_str("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets/v2")
+            return fetch_alpaca_prev_candle_low(symbol, feed=feed, data_base=data_base)
+
+        # Robinhood only supports coarse candle intervals (5m+).
         data = rh.stocks.get_stock_historicals(symbol, interval=interval, span=span, bounds=bounds) or []
         if not isinstance(data, list) or not data:
             return None

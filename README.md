@@ -88,6 +88,6 @@ Sell orders use your full open position for the active symbol.
 
 Enable the **STOP** toggle before buying to automatically place a stop-loss after a buy fills:
 - Stop price = `(previous completed candle low - 0.01)` (configurable via `.env`)
-- Uses Robinhood historicals to find the previous candle.
+- Uses Alpaca 1-minute bars to find the previous candle (see `.env.example` for `ALPACA_DATA_FEED`).
 
 Extension settings are in the extension's Options page (server URL, poll interval, max tickers).
