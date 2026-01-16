@@ -885,7 +885,13 @@
       <div class="news-body">
         <div class="news-status">select a ticker…</div>
         <div class="news-analysis hidden">
-          <div class="news-sentiment"></div>
+          <div class="news-sentiment">
+            <div class="sentiment-score" title="Sentiment score (0-100)">--</div>
+            <div class="sentiment-label">neutral</div>
+          </div>
+          <div class="sentiment-bar" aria-hidden="true">
+            <div class="sentiment-bar-fill"></div>
+          </div>
           <div class="news-summary"></div>
           <ul class="news-points"></ul>
         </div>
@@ -1689,6 +1695,9 @@
     const statusEl = wrap.querySelector(".news-status");
     const analysisEl = wrap.querySelector(".news-analysis");
     const sentimentEl = wrap.querySelector(".news-sentiment");
+    const sentimentScoreEl = wrap.querySelector(".sentiment-score");
+    const sentimentLabelEl = wrap.querySelector(".sentiment-label");
+    const sentimentBarFillEl = wrap.querySelector(".sentiment-bar-fill");
     const summaryEl = wrap.querySelector(".news-summary");
     const pointsEl = wrap.querySelector(".news-points");
     const listEl = wrap.querySelector(".news-list");
@@ -1702,7 +1711,12 @@
     const analysis = payload?.analysis && typeof payload.analysis === "object" ? payload.analysis : null;
 
     if (analysisEl) analysisEl.classList.add("hidden");
-    if (sentimentEl) sentimentEl.textContent = "";
+    if (sentimentScoreEl) sentimentScoreEl.textContent = "--";
+    if (sentimentLabelEl) sentimentLabelEl.textContent = "";
+    if (sentimentBarFillEl) {
+      sentimentBarFillEl.style.width = "0%";
+      sentimentBarFillEl.style.background = "";
+    }
     if (summaryEl) summaryEl.textContent = "";
     if (pointsEl) pointsEl.textContent = "";
 
@@ -1726,9 +1740,23 @@
       if (!aErr) {
         const score = Number(analysis?.sentiment_score);
         const label = String(analysis?.sentiment_label || "").trim();
-        const scoreText = Number.isFinite(score) ? String(Math.max(0, Math.min(100, Math.round(score)))) : "?";
+        const scoreInt = Number.isFinite(score) ? Math.max(0, Math.min(100, Math.round(score))) : null;
+        const scoreText = scoreInt == null ? "?" : String(scoreInt);
         const lbText = Number.isFinite(lookbackH) && lookbackH > 0 ? ` · last ${lookbackH}h` : "";
-        sentimentEl.textContent = `Sentiment: ${scoreText}${label ? ` (${label})` : ""}${lbText}`;
+        const hue = scoreInt == null ? 0 : Math.round((scoreInt / 100) * 120); // 0=red, 120=green
+        const color = `hsl(${hue} 92% 55%)`;
+        if (sentimentScoreEl) {
+          sentimentScoreEl.textContent = scoreText;
+          sentimentScoreEl.style.color = color;
+        }
+        if (sentimentLabelEl) {
+          sentimentLabelEl.textContent = `${label || "neutral"}${lbText}`;
+          sentimentLabelEl.style.color = "rgba(255, 255, 255, 0.82)";
+        }
+        if (sentimentBarFillEl && scoreInt != null) {
+          sentimentBarFillEl.style.width = `${scoreInt}%`;
+          sentimentBarFillEl.style.background = color;
+        }
         summaryEl.textContent = String(analysis?.summary || "").trim();
         const points = Array.isArray(analysis?.key_points) ? analysis.key_points : [];
         for (const p of points.slice(0, 6)) {
