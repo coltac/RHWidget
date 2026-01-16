@@ -1,7 +1,155 @@
 (() => {
   const WIDGET_ID = "rh-momo-widget-root";
-  if (window.top !== window) return;
-  if (document.getElementById(WIDGET_ID)) return;
+  const IS_TOP = window.top === window;
+  if (IS_TOP && document.getElementById(WIDGET_ID)) return;
+
+  function parseRGBA(css) {
+    const s = String(css || "");
+    const m = s.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([0-9.]+))?\s*\)/i);
+    if (!m) return null;
+    return { r: Number(m[1]), g: Number(m[2]), b: Number(m[3]), a: m[4] == null ? 1 : Number(m[4]) };
+  }
+
+  function isSolidBg(bgCss, minAlpha = 0.2) {
+    const c = parseRGBA(bgCss);
+    return !!c && (Number(c.a) || 0) >= minAlpha;
+  }
+
+  function isGreenish(bgCss) {
+    const c = parseRGBA(bgCss);
+    if (!c || (Number(c.a) || 0) < 0.2) return false;
+    return c.g > c.r + 40 && c.g > c.b + 40;
+  }
+
+  function isRedish(bgCss) {
+    const c = parseRGBA(bgCss);
+    if (!c || (Number(c.a) || 0) < 0.2) return false;
+    return c.r > c.g + 40 && c.r > c.b + 40;
+  }
+
+  function isWhiteishText(colorCss) {
+    const c = parseRGBA(colorCss);
+    if (!c) return false;
+    return c.r > 220 && c.g > 220 && c.b > 220;
+  }
+
+  function extractPriceText(raw) {
+    const s0 = String(raw || "").trim();
+    if (!s0) return null;
+    const s = s0.replaceAll(",", "");
+    const m = s.match(/-?\d+(?:\.\d+)?/);
+    if (!m) return null;
+    const n = Number(m[0]);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    return n;
+  }
+
+  function pickCursorPriceRightEdge(mouseY) {
+    const y = Math.min(Math.max(0, Math.round(mouseY)), Math.max(0, window.innerHeight - 1));
+    const offsets = [6, 18, 32];
+    let best = null;
+
+    for (const off of offsets) {
+      const x = Math.max(0, Math.round(window.innerWidth - off));
+      let els = [];
+      try {
+        els = document.elementsFromPoint(x, y);
+      } catch {
+        els = [];
+      }
+      for (const el of els) {
+        if (!(el instanceof Element)) continue;
+        const raw = el.innerText || el.textContent || el.getAttribute?.("aria-label") || el.getAttribute?.("title") || "";
+        const price = extractPriceText(raw);
+        if (price == null) continue;
+
+        let rect;
+        try {
+          rect = el.getBoundingClientRect();
+        } catch {
+          rect = null;
+        }
+        if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+        if (rect.right < window.innerWidth - 140) continue;
+        if (rect.width > 180 || rect.height > 70) continue;
+
+        let cs;
+        try {
+          cs = getComputedStyle(el);
+        } catch {
+          cs = null;
+        }
+        const bg = cs?.backgroundColor || "";
+        const fg = cs?.color || "";
+        if (!isSolidBg(bg, 0.2)) continue;
+        if (isGreenish(bg) || isRedish(bg)) continue;
+        if (!isWhiteishText(fg)) continue;
+
+        const yCenter = rect.top + rect.height / 2;
+        const yDist = Math.abs(yCenter - y);
+        if (yDist > 55) continue;
+
+        // Bonus if the '+' icon is immediately to the left of the label.
+        let plusFound = false;
+        const probeX = Math.min(Math.max(0, Math.round(rect.left - 8)), window.innerWidth - 1);
+        const probeY = Math.min(Math.max(0, Math.round(yCenter)), window.innerHeight - 1);
+        try {
+          for (const pEl of document.elementsFromPoint(probeX, probeY)) {
+            const t = String(pEl?.innerText || pEl?.textContent || "").trim();
+            if (t === "+") {
+              plusFound = true;
+              break;
+            }
+          }
+        } catch {
+          // ignore
+        }
+
+        const score = (plusFound ? 1000 : 0) + (window.innerWidth - rect.right) * -2 - yDist;
+        if (!best || score > best.score) best = { price, score };
+      }
+    }
+
+    return best?.price ?? null;
+  }
+
+  if (!IS_TOP) {
+    // Cursor reporter for iframe charts. We only postMessage; top frame renders UI and uses the value.
+    let lastMouseY = 0;
+    let lastSent = 0;
+    let lastPrice = null;
+    let rafPending = false;
+
+    function frame() {
+      rafPending = false;
+      const now = performance.now();
+      if (now - lastSent < 50) return; // ~20Hz
+      const price = pickCursorPriceRightEdge(lastMouseY);
+      if (price != null && price !== lastPrice) {
+        lastPrice = price;
+        lastSent = now;
+        try {
+          window.top.postMessage({ __rhwidget: true, type: "cursor_price", price, ts: Date.now() }, "*");
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    window.addEventListener(
+      "mousemove",
+      (e) => {
+        lastMouseY = e.clientY;
+        if (!rafPending) {
+          rafPending = true;
+          requestAnimationFrame(frame);
+        }
+      },
+      { passive: true }
+    );
+
+    return;
+  }
 
   const DEFAULTS = {
     apiBase: "http://127.0.0.1:8787",
@@ -400,6 +548,8 @@
   let lastActivatedSymbol = "";
   let loginRequested = false;
   let lastMousePos = null;
+  let lastFrameCursorPrice = null;
+  let lastFrameCursorTs = 0;
 
   async function bindSymbolInput(ui) {
     const overlay = document.createElement("div");
@@ -1087,6 +1237,15 @@
       if (direct != null) return direct;
     }
 
+    if (lastFrameCursorPrice != null && Date.now() - lastFrameCursorTs < 350) {
+      return lastFrameCursorPrice;
+    }
+
+    if (lastMousePos?.y != null) {
+      const rightEdge = pickCursorPriceRightEdge(lastMousePos.y);
+      if (rightEdge != null) return rightEdge;
+    }
+
     const region = currentCfg.cursorPriceAxisRegion;
     if (!region || typeof region !== "object") return null;
     if (!lastMousePos) return null;
@@ -1275,7 +1434,7 @@
         lastGood = null;
         setCursorPrice(ui, null);
       }
-      await sleep(120);
+      await sleep(50);
     }
   }
 
@@ -2456,6 +2615,18 @@
   }
 
   const ui = buildUi();
+  window.addEventListener(
+    "message",
+    (e) => {
+      const data = e?.data;
+      if (!data || data.__rhwidget !== true || data.type !== "cursor_price") return;
+      const price = Number(data.price);
+      if (!Number.isFinite(price) || price <= 0) return;
+      lastFrameCursorPrice = price;
+      lastFrameCursorTs = Date.now();
+    },
+    true
+  );
   document.addEventListener(
     "mousemove",
     (e) => {

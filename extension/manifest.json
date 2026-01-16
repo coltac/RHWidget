@@ -20,7 +20,8 @@
     {
       "matches": ["*://robinhood.com/*", "*://*.robinhood.com/*"],
       "js": ["content.js"],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true
     }
   ],
   "options_page": "options.html"
