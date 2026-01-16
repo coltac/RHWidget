@@ -19,7 +19,8 @@
     orderType: "market",
     buyQtyMode: "dollars",
     buyQty: 1,
-    limitOffset: ""
+    limitOffset: "",
+    autoStop: false
   };
 
   const cssUrl = chrome.runtime.getURL("styles.css");
@@ -836,6 +837,9 @@
           <button class="toggle-btn" data-value="market" type="button">MKT</button>
           <button class="toggle-btn" data-value="limit" type="button">LMT</button>
         </div>
+        <div class="toggle-group auto-stop">
+          <button class="toggle-btn auto-stop-btn" type="button" title="Auto stop-loss: 1¢ below previous candle low">STOP</button>
+        </div>
         <div class="field">
           <label>Buy</label>
           <div class="toggle-group qty-mode" title="Buy amount mode">
@@ -990,6 +994,7 @@
 
     const orderButtons = wrap.querySelectorAll(".order-type .toggle-btn");
     const modeButtons = wrap.querySelectorAll(".qty-mode .toggle-btn");
+    const autoStopBtn = wrap.querySelector(".auto-stop-btn");
     const qtyInput = wrap.querySelector(".qty-input");
     const limitInput = wrap.querySelector(".limit-input");
     orderButtons.forEach((btn) => {
@@ -1007,6 +1012,11 @@
         btn.classList.add("active");
         saveTradeConfig({ wrap });
       });
+    });
+    autoStopBtn?.addEventListener("click", (e) => {
+      e.preventDefault();
+      autoStopBtn.classList.toggle("active");
+      saveTradeConfig({ wrap });
     });
     qtyInput?.addEventListener("change", () => saveTradeConfig({ wrap }));
     limitInput?.addEventListener("change", () => saveTradeConfig({ wrap }));
@@ -1365,6 +1375,8 @@
     if (limitInput && activeEl !== limitInput) limitInput.value = String(offsetVal);
     const limitWrap = wrap.querySelector(".limit-only");
     if (limitWrap) limitWrap.style.display = orderType === "limit" ? "" : "none";
+    const autoStopBtn = wrap.querySelector(".auto-stop-btn");
+    if (autoStopBtn) autoStopBtn.classList.toggle("active", !!cfg.autoStop);
   }
 
   function saveTradeConfig(ui) {
@@ -1373,6 +1385,8 @@
     const orderType = normalizeOrderType(activeBtn?.getAttribute("data-value"));
     const modeBtn = wrap.querySelector(".qty-mode .toggle-btn.active");
     const buyQtyMode = normalizeBuyQtyMode(modeBtn?.getAttribute("data-value"));
+    const autoStopBtn = wrap.querySelector(".auto-stop-btn");
+    const autoStop = !!autoStopBtn?.classList?.contains("active");
     const qtyInput = wrap.querySelector(".qty-input");
     const limitInput = wrap.querySelector(".limit-input");
     let buyQtyRaw = Number(qtyInput?.value || 1);
@@ -1382,11 +1396,12 @@
         ? Math.max(0.01, Math.round(buyQtyRaw * 100) / 100)
         : Math.max(1, Math.floor(buyQtyRaw));
     const limitOffset = String(limitInput?.value || "").trim();
-    chrome.storage.local.set({ orderType, buyQtyMode, buyQty, limitOffset });
+    chrome.storage.local.set({ orderType, buyQtyMode, buyQty, limitOffset, autoStop });
     currentCfg.orderType = orderType;
     currentCfg.buyQtyMode = buyQtyMode;
     currentCfg.buyQty = buyQty;
     currentCfg.limitOffset = limitOffset;
+    currentCfg.autoStop = autoStop;
     applyTradeUi(ui, currentCfg);
   }
 
@@ -1566,6 +1581,8 @@
     }
     const payload = { symbol, order_type: orderType, limit_offset: limitOffset || null };
     if (side === "buy") {
+      const autoStopBtn = wrap.querySelector(".auto-stop-btn");
+      payload.auto_stop = !!autoStopBtn?.classList?.contains("active");
       const activeModeBtn = wrap.querySelector(".qty-mode .toggle-btn.active");
       const buyQtyMode = normalizeBuyQtyMode(activeModeBtn?.getAttribute("data-value") || currentCfg.buyQtyMode);
       const qtyInput = wrap.querySelector(".qty-input");

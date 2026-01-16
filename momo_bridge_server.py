@@ -54,6 +54,7 @@ class BuyRequest(BaseModel):
     symbol: str
     qty: float | None = 1.0
     amount_usd: float | None = None
+    auto_stop: bool | None = None
     order_type: str = "market"
     limit_price: float | None = None
     limit_offset: float | None = None
@@ -498,7 +499,7 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
             )
 
         system = (
-            "You summarize recent stock news and rate sentiment.\n"
+            "You summarize recent stock news and rate sentiment.  The sentiment should be based on the new's likelyhood to increase or reduce the price at the market open.\n"
             "Output ONLY a single JSON object with keys:\n"
             "- summary: string (<= 3 sentences)\n"
             "- sentiment_score: integer 0-100 (50 = neutral)\n"
@@ -507,7 +508,7 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
         )
         user = {
             "symbol": symbol,
-            "instruction": "Analyze sentiment for the stock based only on the provided recent news items.",
+            "instruction": "Analyze sentiment regarding price impact for the stock based only on the provided recent news items.",
             "news_items": trimmed,
         }
 
@@ -561,6 +562,123 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
         key_points = [str(x).strip() for x in key_points if str(x).strip()][:6]
 
         return {"summary": summary, "sentiment_score": score, "sentiment_label": label, "key_points": key_points}
+
+    def _env_bool(name: str, default: bool = False) -> bool:
+        raw = (os.getenv(name) or "").strip().lower()
+        if not raw:
+            return default
+        return raw in {"1", "true", "t", "yes", "y", "on"}
+
+    def _env_float(name: str, default: float) -> float:
+        raw = (os.getenv(name) or "").strip()
+        if not raw:
+            return default
+        try:
+            return float(raw)
+        except Exception:
+            return default
+
+    def _env_str(name: str, default: str) -> str:
+        raw = (os.getenv(name) or "").strip()
+        return raw or default
+
+    def _auto_stop_config(payload: BuyRequest) -> dict[str, Any]:
+        enabled = payload.auto_stop if payload.auto_stop is not None else _env_bool("AUTO_STOP_ENABLED", False)
+        interval = _env_str("AUTO_STOP_INTERVAL", "5minute")
+        span = _env_str("AUTO_STOP_SPAN", "day")
+        bounds = _env_str("AUTO_STOP_BOUNDS", "regular")
+        offset = _env_float("AUTO_STOP_OFFSET", 0.01)
+        max_wait_s = _env_float("AUTO_STOP_MAX_WAIT_S", 12.0)
+        return {
+            "enabled": bool(enabled),
+            "interval": interval,
+            "span": span,
+            "bounds": bounds,
+            "offset": offset,
+            "max_wait_s": max_wait_s,
+        }
+
+    def _interval_seconds(interval: str) -> int | None:
+        v = (interval or "").strip().lower()
+        if v == "5minute":
+            return 300
+        if v == "10minute":
+            return 600
+        if v == "hour":
+            return 3600
+        if v == "day":
+            return 86400
+        if v == "week":
+            return 604800
+        return None
+
+    def get_prev_candle_low(symbol: str, interval: str, span: str, bounds: str) -> float | None:
+        interval_s = _interval_seconds(interval)
+        if not interval_s:
+            raise ValueError("invalid_candle_interval")
+        data = rh.stocks.get_stock_historicals(symbol, interval=interval, span=span, bounds=bounds) or []
+        if not isinstance(data, list) or not data:
+            return None
+        now = datetime.now(tz=UTC)
+        best_dt: datetime | None = None
+        best_low: float | None = None
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            begins_at = _parse_datetime(str(row.get("begins_at") or ""))
+            if not begins_at:
+                continue
+            # Only completed candles.
+            if begins_at + timedelta(seconds=interval_s) > now:
+                continue
+            low_raw = row.get("low_price")
+            if low_raw is None:
+                continue
+            try:
+                low = float(low_raw)
+            except Exception:
+                continue
+            if low <= 0:
+                continue
+            if best_dt is None or begins_at > best_dt:
+                best_dt = begins_at
+                best_low = low
+        return best_low
+
+    async def place_auto_stop_after_buy(
+        symbol: str,
+        before_qty: float,
+        intended_qty: int,
+        stop_price: float,
+        max_wait_s: float,
+    ) -> None:
+        try:
+            max_wait_s = float(max_wait_s)
+        except Exception:
+            max_wait_s = 12.0
+        max_wait_s = min(max(max_wait_s, 1.0), 120.0)
+
+        started = time.monotonic()
+        while time.monotonic() - started < max_wait_s:
+            pos_qty = await asyncio.to_thread(get_position_qty, symbol)
+            delta = float(pos_qty) - float(before_qty)
+            qty_available = int(math.floor(delta + 1e-6))
+            qty_to_protect = min(intended_qty, qty_available)
+            if qty_to_protect > 0:
+                print(f"[trade] placing stop {symbol} qty={qty_to_protect} stop={stop_price}")
+                result = await asyncio.to_thread(
+                    rh.orders.order_sell_stop_loss,
+                    symbol,
+                    qty_to_protect,
+                    stop_price,
+                    None,
+                    "gfd",
+                )
+                order = await _refresh_stock_order(_require_order_ok(result))
+                print(f"[trade] stop placed {symbol} id={order.get('id') or '-'} state={order.get('state') or '-'}")
+                return
+            await asyncio.sleep(0.5)
+        print(f"[trade] stop not placed {symbol} (timeout waiting for fill)")
 
     def get_position_qty(symbol: str) -> float:
         try:
@@ -755,7 +873,10 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
         symbol = (payload.symbol or "").strip().upper()
         if not symbol:
             raise HTTPException(status_code=400, detail="missing_symbol")
+        before_qty = await asyncio.to_thread(get_position_qty, symbol)
         order_type = normalize_order_type(payload.order_type)
+        auto_stop_cfg = _auto_stop_config(payload)
+        stop_info: dict[str, Any] | None = None
 
         if payload.amount_usd is not None:
             amount_usd = float(payload.amount_usd or 0)
@@ -786,6 +907,7 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
                 order_start = time.monotonic()
                 result = await asyncio.to_thread(rh.orders.order_buy_limit, symbol, qty_whole, limit, None, "gfd")
                 print(f"[trade] buy limit submit {symbol} {time.monotonic() - order_start:.3f}s")
+                intended_qty = int(qty_whole)
             else:
                 quote_start = time.monotonic()
                 last = await asyncio.to_thread(get_latest_price, symbol)
@@ -799,6 +921,7 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
                 order_start = time.monotonic()
                 result = await asyncio.to_thread(rh.orders.order_buy_market, symbol, qty_whole, None, "gfd")
                 print(f"[trade] buy market submit {symbol} {time.monotonic() - order_start:.3f}s")
+                intended_qty = int(qty_whole)
         else:
             qty = float(payload.qty or 0)
             if qty <= 0:
@@ -828,9 +951,48 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
                 order_start = time.monotonic()
                 result = await asyncio.to_thread(rh.orders.order_buy_market, symbol, qty_whole, None, "gfd")
                 print(f"[trade] buy market submit {symbol} {time.monotonic() - order_start:.3f}s")
+            intended_qty = int(qty_whole)
+
+        if auto_stop_cfg.get("enabled") and intended_qty > 0:
+            try:
+                prev_low = await asyncio.to_thread(
+                    get_prev_candle_low,
+                    symbol,
+                    str(auto_stop_cfg.get("interval") or ""),
+                    str(auto_stop_cfg.get("span") or ""),
+                    str(auto_stop_cfg.get("bounds") or ""),
+                )
+                if prev_low is None:
+                    stop_info = {"enabled": True, "status": "error", "error": "candle_unavailable"}
+                else:
+                    stop_price = round_price(float(prev_low) - float(auto_stop_cfg.get("offset") or 0.01))
+                    if stop_price <= 0:
+                        stop_info = {"enabled": True, "status": "error", "error": "invalid_stop_price"}
+                    else:
+                        stop_info = {
+                            "enabled": True,
+                            "status": "pending",
+                            "stop_price": stop_price,
+                            "interval": auto_stop_cfg.get("interval"),
+                            "offset": auto_stop_cfg.get("offset"),
+                        }
+            except Exception as exc:
+                stop_info = {"enabled": True, "status": "error", "error": repr(exc)}
+        else:
+            stop_info = {"enabled": False}
         print(f"[trade] buy total {symbol} {time.monotonic() - start_ts:.3f}s")
         order = await _refresh_stock_order(_require_order_ok(result))
-        return JSONResponse({"ok": True, "order": order, "result": result})
+        if stop_info and stop_info.get("enabled") and stop_info.get("status") == "pending":
+            asyncio.create_task(
+                place_auto_stop_after_buy(
+                    symbol=symbol,
+                    before_qty=float(before_qty),
+                    intended_qty=int(intended_qty),
+                    stop_price=float(stop_info["stop_price"]),
+                    max_wait_s=float(auto_stop_cfg.get("max_wait_s") or 12.0),
+                )
+            )
+        return JSONResponse({"ok": True, "order": order, "result": result, "auto_stop": stop_info})
 
     @app.post("/api/trade/sell")
     async def trade_sell(payload: SellRequest = Body(...)) -> JSONResponse:

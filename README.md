@@ -84,4 +84,10 @@ Buy orders use the widget's **Buy** field: toggle **SH** for shares or **$** for
 - **$ + Limit** converts dollars to a whole-share quantity at the computed limit price (rounds down).
 Sell orders use your full open position for the active symbol.
 
+### Auto stop-loss (optional)
+
+Enable the **STOP** toggle before buying to automatically place a stop-loss after a buy fills:
+- Stop price = `(previous completed candle low - 0.01)` (configurable via `.env`)
+- Uses Robinhood historicals to find the previous candle.
+
 Extension settings are in the extension's Options page (server URL, poll interval, max tickers).

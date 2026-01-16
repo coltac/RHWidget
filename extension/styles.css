@@ -346,6 +346,11 @@ table.table td[data-signed="zero"] {
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
+.toggle-group.auto-stop .toggle-btn {
+  font-weight: 750;
+  letter-spacing: 0.6px;
+}
+
 .trade-controls .field {
   display: flex;
   align-items: center;
