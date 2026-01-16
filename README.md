@@ -52,6 +52,7 @@ The widget header has two small training buttons:
 
 - **B (Bind symbol input):** click this, then click the Legend symbol/search input. This teaches the widget where to click and type when you click a ticker.
 - **T (Train active symbol):** click this, then drag a box around the on-screen symbol/ticker that represents the current active chart. This lets hotkeys (buy/sell) know which symbol is active.
+- **P (Train cursor price axis):** drag a box around the y-axis price labels area (used to read the crosshair price).
 - **N (News):** toggles a detachable news panel for the active ticker (drag/resize; position is saved).
 
 Press `Esc` to cancel a training mode.
@@ -88,6 +89,7 @@ Sell orders use your full open position for the active symbol.
 
 Enable the **STOP** toggle before buying to automatically place a stop-loss after a buy fills:
 - Stop price = `(previous completed candle low - 0.01)` (configurable via `.env`)
-- Uses Alpaca 1-minute bars to find the previous candle (see `.env.example` for `ALPACA_DATA_FEED`).
+- If **P (cursor price axis)** is trained and your crosshair is on the previous candle low when you buy, it reads the on-screen price and uses that (avoids broker-to-broker price differences).
+- Otherwise it falls back to Alpaca 1-minute bars (see `.env.example` for `ALPACA_DATA_FEED`).
 
 Extension settings are in the extension's Options page (server URL, poll interval, max tickers).

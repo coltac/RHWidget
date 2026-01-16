@@ -55,6 +55,8 @@ class BuyRequest(BaseModel):
     qty: float | None = 1.0
     amount_usd: float | None = None
     auto_stop: bool | None = None
+    stop_ref_price: float | None = None
+    stop_price: float | None = None
     order_type: str = "market"
     limit_price: float | None = None
     limit_offset: float | None = None
@@ -1028,27 +1030,45 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
 
         if auto_stop_cfg.get("enabled") and intended_qty > 0:
             try:
-                prev_low = await asyncio.to_thread(
-                    get_prev_candle_low,
-                    symbol,
-                    str(auto_stop_cfg.get("interval") or ""),
-                    str(auto_stop_cfg.get("span") or ""),
-                    str(auto_stop_cfg.get("bounds") or ""),
-                )
-                if prev_low is None:
-                    stop_info = {"enabled": True, "status": "error", "error": "candle_unavailable"}
+                offset = float(auto_stop_cfg.get("offset") or 0.01)
+                explicit_stop = float(payload.stop_price) if payload.stop_price is not None else None
+                ref_price = float(payload.stop_ref_price) if payload.stop_ref_price is not None else None
+
+                source = "candle"
+                if explicit_stop is not None:
+                    stop_price = round_price(explicit_stop)
+                    source = "explicit"
+                elif ref_price is not None:
+                    stop_price = round_price(ref_price - offset)
+                    source = "cursor"
                 else:
-                    stop_price = round_price(float(prev_low) - float(auto_stop_cfg.get("offset") or 0.01))
-                    if stop_price <= 0:
-                        stop_info = {"enabled": True, "status": "error", "error": "invalid_stop_price"}
+                    prev_low = await asyncio.to_thread(
+                        get_prev_candle_low,
+                        symbol,
+                        str(auto_stop_cfg.get("interval") or ""),
+                        str(auto_stop_cfg.get("span") or ""),
+                        str(auto_stop_cfg.get("bounds") or ""),
+                    )
+                    if prev_low is None:
+                        stop_info = {"enabled": True, "status": "error", "error": "candle_unavailable"}
+                        stop_price = None
                     else:
-                        stop_info = {
-                            "enabled": True,
-                            "status": "pending",
-                            "stop_price": stop_price,
-                            "interval": auto_stop_cfg.get("interval"),
-                            "offset": auto_stop_cfg.get("offset"),
-                        }
+                        stop_price = round_price(float(prev_low) - offset)
+
+                if stop_price is None:
+                    pass
+                elif stop_price <= 0 or not math.isfinite(float(stop_price)):
+                    stop_info = {"enabled": True, "status": "error", "error": "invalid_stop_price"}
+                else:
+                    stop_info = {
+                        "enabled": True,
+                        "status": "pending",
+                        "stop_price": float(stop_price),
+                        "source": source,
+                        "interval": auto_stop_cfg.get("interval"),
+                        "offset": offset,
+                        "ref_price": ref_price if source == "cursor" else None,
+                    }
             except Exception as exc:
                 stop_info = {"enabled": True, "status": "error", "error": repr(exc)}
         else:

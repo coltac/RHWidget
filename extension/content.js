@@ -11,6 +11,7 @@
     symbolTypeSelector: "",
     activeSymbolPath: [],
     activeSymbolRegion: null,
+    cursorPriceAxisRegion: null,
     widgetPos: null,
     widgetSize: null,
     newsVisible: false,
@@ -397,6 +398,7 @@
   let currentCfg = { ...DEFAULTS };
   let lastActivatedSymbol = "";
   let loginRequested = false;
+  let lastMousePos = null;
 
   async function bindSymbolInput(ui) {
     const overlay = document.createElement("div");
@@ -539,6 +541,97 @@
       currentCfg.activeSymbolPath = [];
       cleanup();
       setStatus(ui, "ok", "trained");
+      await sleep(900);
+      setStatus(ui, "ok", "live");
+    };
+
+    window.addEventListener("keydown", onKey, true);
+    document.addEventListener("mousedown", onDown, true);
+    document.addEventListener("mousemove", onMove, true);
+    document.addEventListener("mouseup", onUp, true);
+  }
+
+  async function bindCursorPriceAxis(ui) {
+    const overlay = document.createElement("div");
+    overlay.style.cssText =
+      "position:fixed;inset:0;z-index:2147483646;pointer-events:none;" +
+      "background:rgba(0,0,0,.22);display:flex;align-items:flex-start;justify-content:center;padding-top:18px;";
+    const card = document.createElement("div");
+    card.style.cssText =
+      "pointer-events:none;background:rgba(16,20,33,.96);color:#fff;border:1px solid rgba(255,255,255,.18);" +
+      "border-radius:12px;padding:10px 12px;max-width:720px;width:calc(100vw - 40px);font:13px system-ui;";
+    card.textContent = "Train cursor price axis: drag-select the y-axis price labels area (press Esc to cancel).";
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+
+    const selection = document.createElement("div");
+    selection.style.cssText =
+      "position:fixed;border:2px dashed rgba(255,255,255,.8);background:rgba(120,170,255,.15);" +
+      "pointer-events:none;display:none;z-index:2147483647;";
+    document.body.appendChild(selection);
+
+    const cleanup = () => {
+      overlay.remove();
+      selection.remove();
+      window.removeEventListener("keydown", onKey, true);
+      document.removeEventListener("mousedown", onDown, true);
+      document.removeEventListener("mousemove", onMove, true);
+      document.removeEventListener("mouseup", onUp, true);
+    };
+
+    const onKey = async (e) => {
+      if (e.key !== "Escape") return;
+      cleanup();
+      setStatus(ui, "ok", "canceled");
+      await sleep(800);
+      setStatus(ui, "ok", "live");
+    };
+
+    let start = null;
+    const onDown = (e) => {
+      if (ui.root.contains(e.target)) return;
+      start = { x: e.clientX, y: e.clientY };
+      selection.style.left = `${start.x}px`;
+      selection.style.top = `${start.y}px`;
+      selection.style.width = "0px";
+      selection.style.height = "0px";
+      selection.style.display = "";
+    };
+
+    const onMove = (e) => {
+      if (!start) return;
+      const x = Math.min(start.x, e.clientX);
+      const y = Math.min(start.y, e.clientY);
+      const w = Math.abs(e.clientX - start.x);
+      const h = Math.abs(e.clientY - start.y);
+      selection.style.left = `${x}px`;
+      selection.style.top = `${y}px`;
+      selection.style.width = `${w}px`;
+      selection.style.height = `${h}px`;
+    };
+
+    const onUp = async (e) => {
+      if (!start) return;
+      const x = Math.min(start.x, e.clientX);
+      const y = Math.min(start.y, e.clientY);
+      const w = Math.abs(e.clientX - start.x);
+      const h = Math.abs(e.clientY - start.y);
+      start = null;
+      if (w < 6 || h < 6) return;
+
+      const vw = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1);
+      const vh = Math.max(1, window.innerHeight || document.documentElement.clientHeight || 1);
+      const region = {
+        x: x / vw,
+        y: y / vh,
+        w: w / vw,
+        h: h / vh
+      };
+
+      await chrome.storage.local.set({ cursorPriceAxisRegion: region });
+      currentCfg.cursorPriceAxisRegion = region;
+      cleanup();
+      setStatus(ui, "ok", "price axis trained");
       await sleep(900);
       setStatus(ui, "ok", "live");
     };
@@ -771,6 +864,118 @@
     return lastActivatedSymbol;
   }
 
+  function extractPrice(raw) {
+    const s0 = String(raw || "").trim();
+    if (!s0) return null;
+    const s = s0.replaceAll(",", "");
+    const m = s.match(/-?\d+(?:\.\d+)?/);
+    if (!m) return null;
+    const n = Number(m[0]);
+    if (!Number.isFinite(n)) return null;
+    if (n <= 0) return null;
+    return n;
+  }
+
+  function parseRgb(cssColor) {
+    const s = String(cssColor || "");
+    const m = s.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([0-9.]+))?\s*\)/i);
+    if (!m) return null;
+    return {
+      r: Number(m[1]),
+      g: Number(m[2]),
+      b: Number(m[3]),
+      a: m[4] == null ? 1 : Number(m[4])
+    };
+  }
+
+  function colorLuma01(rgb) {
+    if (!rgb) return 0;
+    const r = Math.max(0, Math.min(255, Number(rgb.r) || 0)) / 255;
+    const g = Math.max(0, Math.min(255, Number(rgb.g) || 0)) / 255;
+    const b = Math.max(0, Math.min(255, Number(rgb.b) || 0)) / 255;
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  }
+
+  function detectCursorPrice(ui) {
+    const region = currentCfg.cursorPriceAxisRegion;
+    if (!region || typeof region !== "object") return null;
+    if (!lastMousePos) return null;
+
+    const vw = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1);
+    const vh = Math.max(1, window.innerHeight || document.documentElement.clientHeight || 1);
+    const rx = Math.floor((region.x || 0) * vw);
+    const ry = Math.floor((region.y || 0) * vh);
+    const rw = Math.floor((region.w || 0) * vw);
+    const rh = Math.floor((region.h || 0) * vh);
+    if (rw < 6 || rh < 6) return null;
+
+    const x0 = rx + Math.floor(rw * 0.2);
+    const x1 = rx + Math.floor(rw * 0.5);
+    const x2 = rx + Math.floor(rw * 0.8);
+    const yBase = Math.min(Math.max(ry, lastMousePos.y), ry + rh - 1);
+    const ySamples = [yBase - 8, yBase, yBase + 8].map((y) => Math.min(Math.max(ry, y), ry + rh - 1));
+    const xSamples = [x0, x1, x2].map((x) => Math.min(Math.max(rx, x), rx + rw - 1));
+
+    const elements = new Set();
+    for (const y of ySamples) {
+      for (const x of xSamples) {
+        try {
+          for (const el of document.elementsFromPoint(x, y)) {
+            if (el instanceof Element) elements.add(el);
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    const regionRect = { left: rx, top: ry, right: rx + rw, bottom: ry + rh, area: rw * rh };
+    let best = null;
+    for (const el of elements) {
+      if (!(el instanceof Element)) continue;
+      if (ui?.root && ui.root.contains(el)) continue;
+      let rect;
+      try {
+        rect = el.getBoundingClientRect();
+      } catch {
+        continue;
+      }
+      if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+      const left = Math.max(regionRect.left, rect.left);
+      const top = Math.max(regionRect.top, rect.top);
+      const right = Math.min(regionRect.right, rect.right);
+      const bottom = Math.min(regionRect.bottom, rect.bottom);
+      const iw = right - left;
+      const ih = bottom - top;
+      if (iw <= 0 || ih <= 0) continue;
+      const overlap = (iw * ih) / Math.max(1, regionRect.area);
+      if (overlap < 0.01) continue;
+
+      const raw = elementTextOrValue(el) || el.getAttribute?.("aria-label") || el.getAttribute?.("title") || "";
+      const price = extractPrice(raw);
+      if (price == null) continue;
+
+      let style;
+      try {
+        style = getComputedStyle(el);
+      } catch {
+        style = null;
+      }
+      const fg = style ? parseRgb(style.color) : null;
+      const bg = style ? parseRgb(style.backgroundColor) : null;
+      const luma = colorLuma01(fg);
+      const hasBg = bg ? (bg.a ?? 1) > 0.05 && !(bg.r === 0 && bg.g === 0 && bg.b === 0 && (bg.a ?? 1) === 0) : false;
+      const rectArea = rect.width * rect.height;
+      const yCenter = rect.top + rect.height / 2;
+      const yDist = Math.abs(yCenter - yBase);
+
+      const score = overlap * 100 + luma * 40 + (hasBg ? 25 : 0) - rectArea / 4000 - yDist / 10;
+      if (!best || score > best.score) best = { price, score };
+    }
+
+    return best?.price ?? null;
+  }
+
   function setActiveSymbol(ui, symbol) {
     const el = ui.wrap.querySelector(".active-symbol");
     if (!el) return;
@@ -818,6 +1023,7 @@
         <div class="right">
           <button class="icon-btn bind-btn" title="Bind symbol input" type="button">B</button>
           <button class="icon-btn train-btn" title="Train active-symbol region" type="button">T</button>
+          <button class="icon-btn price-btn" title="Train cursor price axis region" type="button">P</button>
           <button class="icon-btn news-btn" title="News" type="button">N</button>
           <button class="icon-btn settings-btn" title="Settings" type="button">⚙</button>
           <button class="login-btn" title="Login to Robinhood" type="button">Login</button>
@@ -990,6 +1196,15 @@
       e.stopImmediatePropagation?.();
       setStatus({ wrap }, "connecting", "train mode");
       await bindActiveSymbol({ root, wrap });
+    });
+
+    const priceBtn = wrap.querySelector(".price-btn");
+    priceBtn?.addEventListener("click", async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation?.();
+      setStatus({ wrap }, "connecting", "price train");
+      await bindCursorPriceAxis({ root, wrap });
     });
 
     const orderButtons = wrap.querySelectorAll(".order-type .toggle-btn");
@@ -1583,6 +1798,10 @@
     if (side === "buy") {
       const autoStopBtn = wrap.querySelector(".auto-stop-btn");
       payload.auto_stop = !!autoStopBtn?.classList?.contains("active");
+      if (payload.auto_stop) {
+        const cursorPrice = detectCursorPrice(ui);
+        if (cursorPrice != null) payload.stop_ref_price = cursorPrice;
+      }
       const activeModeBtn = wrap.querySelector(".qty-mode .toggle-btn.active");
       const buyQtyMode = normalizeBuyQtyMode(activeModeBtn?.getAttribute("data-value") || currentCfg.buyQtyMode);
       const qtyInput = wrap.querySelector(".qty-input");
@@ -1631,7 +1850,15 @@
         const data = await res.json().catch(() => null);
         const order = data?.order || data?.result || null;
         const state = String(order?.state || "").trim();
-        const msg = state ? `${side} ${state} ${symbol}` : `${side} sent ${symbol}`;
+        let extra = "";
+        if (side === "buy") {
+          const s = data?.auto_stop;
+          const stopPrice = Number(s?.stop_price);
+          if (s?.enabled && s?.status === "pending" && Number.isFinite(stopPrice) && stopPrice > 0) {
+            extra = ` stop @ ${stopPrice.toFixed(2)}`;
+          }
+        }
+        const msg = state ? `${side} ${state} ${symbol}${extra}` : `${side} sent ${symbol}${extra}`;
         setStatus(ui, "ok", msg);
         setTradeStatus(ui, "ok", msg);
       }
@@ -1913,6 +2140,14 @@
   }
 
   const ui = buildUi();
+  document.addEventListener(
+    "mousemove",
+    (e) => {
+      if (ui?.wrap?.contains?.(e.target)) return;
+      lastMousePos = { x: e.clientX, y: e.clientY };
+    },
+    true
+  );
   initConfig(ui);
   installRouteWatcher(ui);
   installHotkeys(ui);
