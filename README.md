@@ -56,6 +56,15 @@ The widget header has two small training buttons:
 
 Press `Esc` to cancel a training mode.
 
+### News + sentiment
+
+The news panel pulls recent headlines from Alpaca News and sends them to a locally hosted LM Studio model for a short summary + a 0–100 sentiment score.
+
+Configure `.env` (see `.env.example`):
+- `NEWS_LOOKBACK_HOURS` (only use news within this window)
+- `ALPACA_API_KEY` / `ALPACA_API_SECRET` (or `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY`)
+- `LMSTUDIO_BASE_URL` / `LMSTUDIO_MODEL`
+
 ### Hotkeys
 
 - **Buy:** `Shift+1`

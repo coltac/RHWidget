@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import html
+import json
 import math
 import os
 import pickle
 import time
 import urllib.parse
 import urllib.request
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from dotenv import load_dotenv
@@ -360,36 +359,208 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
             return None
         return None
 
-    def fetch_news(symbol: str, limit: int = 12) -> list[dict[str, Any]]:
-        query = f"{symbol} stock"
-        url = (
-            "https://news.google.com/rss/search?q="
-            + urllib.parse.quote_plus(query)
-            + "&hl=en-US&gl=US&ceid=US:en"
-        )
+    def _parse_datetime(value: str) -> datetime | None:
+        if not value:
+            return None
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            # Alpaca commonly returns RFC3339 with "Z".
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            return dt.astimezone(UTC)
+        except Exception:
+            return None
+
+    def _news_lookback_hours() -> float:
+        raw = os.getenv("NEWS_LOOKBACK_HOURS", "6").strip()
+        try:
+            hours = float(raw)
+        except Exception:
+            hours = 6.0
+        if hours <= 0:
+            hours = 6.0
+        return min(max(hours, 0.25), 168.0)  # clamp to [15m, 7d]
+
+    def fetch_alpaca_news(symbol: str, start_dt: datetime, limit: int = 12) -> list[dict[str, Any]]:
+        api_key = (os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID") or "").strip()
+        api_secret = (os.getenv("ALPACA_API_SECRET") or os.getenv("APCA_API_SECRET_KEY") or "").strip()
+        if not api_key or not api_secret:
+            raise RuntimeError("missing_alpaca_credentials")
+
+        base = (os.getenv("ALPACA_NEWS_BASE_URL") or "https://data.alpaca.markets/v1beta1").strip()
+        if not base:
+            base = "https://data.alpaca.markets/v1beta1"
+
+        end_dt = datetime.now(tz=UTC)
+        params = {
+            "symbols": symbol,
+            "start": start_dt.isoformat().replace("+00:00", "Z"),
+            "end": end_dt.isoformat().replace("+00:00", "Z"),
+            "limit": str(max(1, min(50, int(limit)))),
+        }
+        url = f"{base.rstrip('/')}/news?{urllib.parse.urlencode(params)}"
         req = urllib.request.Request(
             url,
             headers={
-                "User-Agent": "Mozilla/5.0 (RHWidget) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
+                "APCA-API-KEY-ID": api_key,
+                "APCA-API-SECRET-KEY": api_secret,
+                "Accept": "application/json",
+                "User-Agent": "RHWidget/0.1 (+local)",
             },
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = resp.read()
-        root = ET.fromstring(data)
-        channel = root.find("channel")
-        if channel is None:
-            return []
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        raw_items = []
+        if isinstance(data, dict):
+            raw_items = data.get("news") or data.get("data") or data.get("items") or []
+        if not isinstance(raw_items, list):
+            raw_items = []
+
         items: list[dict[str, Any]] = []
-        for item in list(channel.findall("item"))[: max(1, min(50, int(limit))) ]:
-            title = html.unescape((item.findtext("title") or "").strip())
-            link = (item.findtext("link") or "").strip()
-            pub_date = (item.findtext("pubDate") or "").strip()
-            source_el = item.find("source")
-            source = html.unescape((source_el.text or "").strip()) if source_el is not None else ""
-            if not title or not link:
+        for it in raw_items:
+            if not isinstance(it, dict):
                 continue
-            items.append({"title": title, "link": link, "pub_date": pub_date, "source": source})
+            created_at = it.get("created_at") or it.get("createdAt") or it.get("time") or ""
+            created_dt = _parse_datetime(str(created_at))
+            if created_dt and created_dt < start_dt.astimezone(UTC):
+                continue
+            headline = (it.get("headline") or it.get("title") or "").strip()
+            summary = (it.get("summary") or it.get("description") or "").strip()
+            link = (it.get("url") or it.get("link") or "").strip()
+            source = (it.get("source") or "").strip()
+            if not headline:
+                continue
+            items.append(
+                {
+                    "title": headline,
+                    "summary": summary,
+                    "link": link,
+                    "source": source,
+                    "created_at": created_dt.isoformat() if created_dt else str(created_at),
+                }
+            )
+
+        # Sort newest first when timestamps are available.
+        def sort_key(x: dict[str, Any]) -> float:
+            dt = _parse_datetime(str(x.get("created_at") or ""))
+            return dt.timestamp() if dt else 0.0
+
+        items.sort(key=sort_key, reverse=True)
         return items
+
+    def _extract_json_object(text: str) -> dict[str, Any] | None:
+        if not text:
+            return None
+        s = text.strip()
+        if not s:
+            return None
+        try:
+            obj = json.loads(s)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            pass
+        # Try to salvage the first JSON object region.
+        start = s.find("{")
+        end = s.rfind("}")
+        if start >= 0 and end > start:
+            chunk = s[start : end + 1]
+            try:
+                obj = json.loads(chunk)
+                return obj if isinstance(obj, dict) else None
+            except Exception:
+                return None
+        return None
+
+    def analyze_news_with_lmstudio(symbol: str, items: list[dict[str, Any]]) -> dict[str, Any]:
+        base = (os.getenv("LMSTUDIO_BASE_URL") or "http://127.0.0.1:1234/v1").strip()
+        model = (os.getenv("LMSTUDIO_MODEL") or "local-model").strip()
+        if not base:
+            raise RuntimeError("missing_lmstudio_base_url")
+
+        trimmed = []
+        for it in items[:20]:
+            if not isinstance(it, dict):
+                continue
+            trimmed.append(
+                {
+                    "title": str(it.get("title") or "").strip(),
+                    "summary": str(it.get("summary") or "").strip(),
+                    "source": str(it.get("source") or "").strip(),
+                    "created_at": str(it.get("created_at") or "").strip(),
+                    "link": str(it.get("link") or "").strip(),
+                }
+            )
+
+        system = (
+            "You summarize recent stock news and rate sentiment.\n"
+            "Output ONLY a single JSON object with keys:\n"
+            "- summary: string (<= 3 sentences)\n"
+            "- sentiment_score: integer 0-100 (50 = neutral)\n"
+            "- sentiment_label: one of 'bearish','neutral','bullish'\n"
+            "- key_points: array of short strings (<= 6 items)\n"
+        )
+        user = {
+            "symbol": symbol,
+            "instruction": "Analyze sentiment for the stock based only on the provided recent news items.",
+            "news_items": trimmed,
+        }
+
+        payload = {
+            "model": model,
+            "temperature": 0.2,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(user)},
+            ],
+        }
+
+        url = f"{base.rstrip('/')}/chat/completions"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        content = ""
+        try:
+            content = str(data["choices"][0]["message"]["content"] or "")
+        except Exception:
+            content = ""
+
+        obj = _extract_json_object(content)
+        if not obj:
+            raise RuntimeError("lmstudio_invalid_json")
+
+        score_raw = obj.get("sentiment_score")
+        try:
+            score = int(score_raw)
+        except Exception:
+            score = 50
+        score = min(max(score, 0), 100)
+
+        label = str(obj.get("sentiment_label") or "").strip().lower()
+        if label not in {"bearish", "neutral", "bullish"}:
+            label = "neutral" if 40 <= score <= 60 else ("bullish" if score > 60 else "bearish")
+
+        summary = str(obj.get("summary") or "").strip()
+        if not summary:
+            summary = "No summary available."
+
+        key_points = obj.get("key_points")
+        if not isinstance(key_points, list):
+            key_points = []
+        key_points = [str(x).strip() for x in key_points if str(x).strip()][:6]
+
+        return {"summary": summary, "sentiment_score": score, "sentiment_label": label, "key_points": key_points}
 
     def get_position_qty(symbol: str) -> float:
         try:
@@ -483,27 +654,54 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
         if not sym or sym in {"-", "—"}:
             raise HTTPException(status_code=400, detail="missing_symbol")
 
+        lookback_h = _news_lookback_hours()
+        start_dt = datetime.now(tz=UTC) - timedelta(hours=lookback_h)
+
         now = time.monotonic()
         async with news_lock:
             cached = news_cache.get(sym)
-            if cached and isinstance(cached.get("ts"), (int, float)) and now - float(cached["ts"]) < 45:
+            if (
+                cached
+                and isinstance(cached.get("ts"), (int, float))
+                and now - float(cached["ts"]) < 45
+                and cached.get("lookback_h") == lookback_h
+            ):
                 return JSONResponse(
-                    {"ok": True, "symbol": sym, "items": cached.get("items") or [], "cached": True},
+                    {
+                        "ok": True,
+                        "symbol": sym,
+                        "lookback_hours": lookback_h,
+                        "items": cached.get("items") or [],
+                        "analysis": cached.get("analysis") or None,
+                        "cached": True,
+                    },
                     headers={"Cache-Control": "no-store"},
                 )
 
         try:
-            items = await asyncio.to_thread(fetch_news, sym, limit)
+            items = await asyncio.to_thread(fetch_alpaca_news, sym, start_dt, limit)
         except Exception as exc:
             return JSONResponse(
-                {"ok": False, "symbol": sym, "items": [], "error": repr(exc)},
+                {"ok": False, "symbol": sym, "lookback_hours": lookback_h, "items": [], "error": repr(exc)},
                 status_code=502,
                 headers={"Cache-Control": "no-store"},
             )
 
+        analysis: dict[str, Any] | None = None
+        if items:
+            try:
+                analysis = await asyncio.to_thread(analyze_news_with_lmstudio, sym, items)
+            except Exception as exc:
+                analysis = {"error": repr(exc)}
+        else:
+            analysis = {"summary": "No recent news found in lookback window.", "sentiment_score": 50, "sentiment_label": "neutral", "key_points": []}
+
         async with news_lock:
-            news_cache[sym] = {"ts": now, "items": items}
-        return JSONResponse({"ok": True, "symbol": sym, "items": items, "cached": False}, headers={"Cache-Control": "no-store"})
+            news_cache[sym] = {"ts": now, "lookback_h": lookback_h, "items": items, "analysis": analysis}
+        return JSONResponse(
+            {"ok": True, "symbol": sym, "lookback_hours": lookback_h, "items": items, "analysis": analysis, "cached": False},
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/api/auth/status")
     async def auth_status() -> JSONResponse:

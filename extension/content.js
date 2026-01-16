@@ -884,6 +884,11 @@
       </div>
       <div class="news-body">
         <div class="news-status">select a ticker…</div>
+        <div class="news-analysis hidden">
+          <div class="news-sentiment"></div>
+          <div class="news-summary"></div>
+          <ul class="news-points"></ul>
+        </div>
         <div class="news-list"></div>
       </div>
       <div class="news-resizer" title="Resize"></div>
@@ -1682,6 +1687,10 @@
     if (!wrap) return;
     const symEl = wrap.querySelector(".news-symbol");
     const statusEl = wrap.querySelector(".news-status");
+    const analysisEl = wrap.querySelector(".news-analysis");
+    const sentimentEl = wrap.querySelector(".news-sentiment");
+    const summaryEl = wrap.querySelector(".news-summary");
+    const pointsEl = wrap.querySelector(".news-points");
     const listEl = wrap.querySelector(".news-list");
     if (symEl) symEl.textContent = symbol || "-";
     if (!statusEl || !listEl) return;
@@ -1689,6 +1698,13 @@
     const ok = !!payload?.ok;
     const items = Array.isArray(payload?.items) ? payload.items : [];
     const err = String(payload?.error || payload?.detail || "").trim();
+    const lookbackH = Number(payload?.lookback_hours);
+    const analysis = payload?.analysis && typeof payload.analysis === "object" ? payload.analysis : null;
+
+    if (analysisEl) analysisEl.classList.add("hidden");
+    if (sentimentEl) sentimentEl.textContent = "";
+    if (summaryEl) summaryEl.textContent = "";
+    if (pointsEl) pointsEl.textContent = "";
 
     listEl.textContent = "";
     if (!symbol || symbol === "-" || symbol === "—") {
@@ -1704,11 +1720,32 @@
       return;
     }
     statusEl.textContent = "";
+
+    if (analysis && analysisEl && sentimentEl && summaryEl && pointsEl) {
+      const aErr = String(analysis?.error || "").trim();
+      if (!aErr) {
+        const score = Number(analysis?.sentiment_score);
+        const label = String(analysis?.sentiment_label || "").trim();
+        const scoreText = Number.isFinite(score) ? String(Math.max(0, Math.min(100, Math.round(score)))) : "?";
+        const lbText = Number.isFinite(lookbackH) && lookbackH > 0 ? ` · last ${lookbackH}h` : "";
+        sentimentEl.textContent = `Sentiment: ${scoreText}${label ? ` (${label})` : ""}${lbText}`;
+        summaryEl.textContent = String(analysis?.summary || "").trim();
+        const points = Array.isArray(analysis?.key_points) ? analysis.key_points : [];
+        for (const p of points.slice(0, 6)) {
+          const li = document.createElement("li");
+          li.textContent = String(p || "").trim();
+          if (li.textContent) pointsEl.appendChild(li);
+        }
+        analysisEl.classList.remove("hidden");
+      } else {
+        statusEl.textContent = `analysis error: ${aErr}`;
+      }
+    }
     for (const item of items.slice(0, 20)) {
       const title = String(item?.title || "").trim();
       const link = String(item?.link || "").trim();
       const source = String(item?.source || "").trim();
-      const pub = String(item?.pub_date || "").trim();
+      const pub = String(item?.created_at || item?.pub_date || "").trim();
       if (!title || !link) continue;
 
       const row = document.createElement("div");
