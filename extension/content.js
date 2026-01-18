@@ -1391,7 +1391,7 @@
           <button class="toggle-btn" data-value="limit" type="button">LMT</button>
         </div>
         <div class="toggle-group auto-stop">
-          <button class="toggle-btn auto-stop-btn" type="button" title="Auto stop-loss: (Cursor Price - offset) — default offset 1¢">STOP</button>
+          <button class="toggle-btn auto-stop-btn" type="button" title="Auto stop-loss at Cursor Price">STOP</button>
         </div>
         <div class="field">
           <label>Buy</label>

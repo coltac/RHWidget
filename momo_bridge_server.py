@@ -586,13 +586,11 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
 
     def _auto_stop_config(payload: BuyRequest) -> dict[str, Any]:
         enabled = payload.auto_stop if payload.auto_stop is not None else _env_bool("AUTO_STOP_ENABLED", False)
-        offset = _env_float("AUTO_STOP_OFFSET", 0.01)
         max_wait_s = _env_float("AUTO_STOP_MAX_WAIT_S", 12.0)
         alpaca_feed = _env_str("ALPACA_DATA_FEED", "iex")
         alpaca_data_base = _env_str("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets/v2")
         return {
             "enabled": bool(enabled),
-            "offset": offset,
             "max_wait_s": max_wait_s,
             "alpaca_feed": alpaca_feed,
             "alpaca_data_base": alpaca_data_base,
@@ -1065,7 +1063,6 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
 
         if auto_stop_cfg.get("enabled") and intended_qty > 0:
             try:
-                offset = float(auto_stop_cfg.get("offset") or 0.01)
                 explicit_stop = float(payload.stop_price) if payload.stop_price is not None else None
                 ref_price = float(payload.stop_ref_price) if payload.stop_ref_price is not None else None
 
@@ -1074,7 +1071,7 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
                     stop_price = round_price(explicit_stop)
                     source = "explicit"
                 elif ref_price is not None:
-                    stop_price = round_price(ref_price - offset)
+                    stop_price = round_price(ref_price)
                     source = "cursor"
                 else:
                     stop_info = {"enabled": True, "status": "error", "error": "missing_stop_ref_price"}
@@ -1090,7 +1087,6 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
                         "status": "pending",
                         "stop_price": float(stop_price),
                         "source": source,
-                        "offset": offset,
                         "ref_price": ref_price if source == "cursor" else None,
                     }
             except Exception as exc:
