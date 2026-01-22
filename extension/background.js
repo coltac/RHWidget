@@ -2,8 +2,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || msg.type !== "rhwidget_inject_cursor") return;
 
   const tabId = sender?.tab?.id;
-  const frameId = sender?.frameId;
-  if (tabId == null || frameId == null) {
+  if (tabId == null) {
     sendResponse?.({ ok: false, error: "missing_sender" });
     return;
   }
@@ -11,7 +10,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     try {
       await chrome.scripting.executeScript({
-        target: { tabId, frameIds: [frameId] },
+        target: { tabId, allFrames: true },
         world: "MAIN",
         files: ["injected_cursor.js"]
       });
@@ -23,4 +22,3 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   return true;
 });
-

@@ -17,179 +17,61 @@
       }
     }
 
-    function inject() {
+    function maybeInject() {
       try {
         if (!document.documentElement) return;
         if (document.documentElement.dataset.rhwidgetCursorInjected === "1") return;
-
-        const script = document.createElement("script");
-        script.textContent = String.raw`(() => {
-  if (window.__RH_CURSOR_V5__) return;
-
-  const state = {
-    cursorPrice: null,
-    mouseY_canvas: null,
-    lastSent: 0,
-    lastSentPrice: null,
-    hooked: false,
-  };
-  window.__RH_CURSOR_V5__ = state;
-
-  function parseRgb(style) {
-    if (!style) return null;
-    const s = String(style).trim().toLowerCase();
-    const m = s.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-    if (m) return { r: +m[1], g: +m[2], b: +m[3] };
-
-    if (s.startsWith("#")) {
-      let hex = s.slice(1);
-      if (hex.length === 3) hex = hex.split("").map((c) => c + c).join("");
-      if (hex.length !== 6) return null;
-      return {
-        r: parseInt(hex.slice(0, 2), 16),
-        g: parseInt(hex.slice(2, 4), 16),
-        b: parseInt(hex.slice(4, 6), 16),
-      };
-    }
-    return null;
-  }
-
-  function isGreen(style) {
-    const c = parseRgb(style);
-    if (!c) return false;
-    return c.g > 150 && c.g > c.r + 40 && c.g > c.b + 40;
-  }
-
-  function isRed(style) {
-    const c = parseRgb(style);
-    if (!c) return false;
-    return c.r > 150 && c.r > c.g + 40 && c.r > c.b + 40;
-  }
-
-  function isNeutralDark(style) {
-    const c = parseRgb(style);
-    if (!c) return false;
-
-    const lum = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
-    if (lum >= 90) return false;
-
-    const rg = Math.abs(c.r - c.g);
-    const gb = Math.abs(c.g - c.b);
-    const rb = Math.abs(c.r - c.b);
-    const maxDiff = Math.max(rg, gb, rb);
-    return maxDiff < 22;
-  }
-
-  function send(price) {
-    const n = Number(price);
-    if (!Number.isFinite(n) || n <= 0) return;
-    state.cursorPrice = n;
-
-    const now = performance.now();
-    if (now - state.lastSent < 50) return; // ~20Hz
-    if (state.lastSentPrice === n) return;
-    state.lastSent = now;
-    state.lastSentPrice = n;
-
-    try {
-      (window.top || window).postMessage({ __rhwidget: true, type: "cursor_price", price: n, ts: Date.now() }, "*");
-    } catch {}
-  }
-
-  function hookCanvas2D(canvas) {
-    if (!canvas || canvas.__rhHookedV5) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    canvas.__rhHookedV5 = true;
-
-    const origFillRect = ctx.fillRect.bind(ctx);
-    const origFillText = ctx.fillText.bind(ctx);
-    let lastRect = null;
-
-    ctx.fillRect = function (x, y, w, h) {
-      if (w > 28 && w < 260 && h > 14 && h < 80) {
-        lastRect = { t: performance.now(), fill: ctx.fillStyle };
-      }
-      return origFillRect(x, y, w, h);
-    };
-
-    ctx.fillText = function (text, x, y, maxWidth) {
-      try {
-        const s = String(text).trim();
-        if (/^\d+(\.\d+)?$/.test(s)) {
-          const val = parseFloat(s);
-          if (Number.isFinite(val) && val > 0) {
-            const nearRight = x > canvas.width * 0.72;
-            const dy = state.mouseY_canvas == null ? 9999 : Math.abs(y - state.mouseY_canvas);
-            const recent = !!lastRect && performance.now() - lastRect.t < 10;
-            const bgOk =
-              recent && isNeutralDark(lastRect.fill) && !isGreen(lastRect.fill) && !isRed(lastRect.fill);
-
-            if (nearRight && bgOk && dy < 35) send(val);
-          }
-        }
-      } catch {}
-      return origFillText(text, x, y, maxWidth);
-    };
-
-    state.hooked = true;
-  }
-
-  function attachMouseTracker(canvas) {
-    if (!canvas || canvas.__rhMouseV5) return;
-    canvas.__rhMouseV5 = true;
-
-    canvas.addEventListener(
-      "mousemove",
-      (ev) => {
-        try {
-          const rect = canvas.getBoundingClientRect();
-          const scaleY = canvas.height / rect.height;
-          state.mouseY_canvas = (ev.clientY - rect.top) * scaleY;
-        } catch {}
-      },
-      { passive: true }
-    );
-  }
-
-  function installOnce() {
-    const yAxes = Array.from(document.querySelectorAll('canvas[data-element="yAxisLabelsCanvas"]'));
-    const cross = Array.from(document.querySelectorAll('canvas[data-element="crossToolCanvas"]'));
-    const hit = Array.from(document.querySelectorAll('canvas[data-element="hitTestCanvas"]'));
-
-    attachMouseTracker(cross[0] || hit[0] || yAxes[0] || null);
-    yAxes.forEach(hookCanvas2D);
-    cross.forEach(hookCanvas2D);
-    hit.forEach(hookCanvas2D);
-  }
-
-  const mo = new MutationObserver(() => installOnce());
-  try {
-    mo.observe(document.documentElement, { childList: true, subtree: true });
-  } catch {}
-  installOnce();
-  setInterval(installOnce, 1000);
-})();`;
-
-        (document.documentElement || document.head || document.body).appendChild(script);
-        script.remove();
-        document.documentElement.dataset.rhwidgetCursorInjected = "1";
       } catch {
         // ignore
       }
+      requestBackgroundInject();
     }
 
-    const mo = new MutationObserver(() => inject());
+    const mo = new MutationObserver(() => maybeInject());
     try {
       mo.observe(document.documentElement, { childList: true, subtree: true });
     } catch {
       // ignore
     }
-    requestBackgroundInject();
-    inject();
-    setInterval(inject, 2000);
-    setInterval(requestBackgroundInject, 3000);
+
+    // Prefer chrome.scripting (MAIN world) injection via the service worker.
+    // This avoids inline <script> injection which can be blocked by Robinhood's CSP.
+    maybeInject();
+    setInterval(maybeInject, 2000);
+
+    // Track mouse position even if the chart is rendered inside an iframe.
+    // Forward mouse coordinates to the top window so top-frame cursor detection can work.
+    try {
+      document.addEventListener(
+        "mousemove",
+        (ev) => {
+          try {
+            if (!ev) return;
+            let x = ev.clientX;
+            let y = ev.clientY;
+
+            // Convert to top-window client coords by walking up through frameElements.
+            let w = window;
+            while (w && w !== w.top) {
+              const fe = w.frameElement;
+              if (!(fe instanceof Element)) break;
+              const r = fe.getBoundingClientRect();
+              x += r.left;
+              y += r.top;
+              w = w.parent;
+            }
+
+            const target = window.top && window.top !== window ? window.top : window;
+            target.postMessage({ __rhwidget: true, type: "cursor_mouse", x, y, ts: Date.now() }, "*");
+          } catch {
+            // ignore
+          }
+        },
+        { passive: true, capture: true }
+      );
+    } catch {
+      // ignore
+    }
   }
 
   installCanvasCursorReader();
@@ -201,6 +83,8 @@
     limit: 30,
     symbolClickSelector: "",
     symbolTypeSelector: "",
+    cursorPricePath: [],
+    cursorPriceAxisRegion: null,
     activeSymbolPath: [],
     activeSymbolRegion: null,
     widgetPos: null,
@@ -655,7 +539,7 @@
   async function bindActiveSymbol(ui) {
     const overlay = document.createElement("div");
     overlay.style.cssText =
-      "position:fixed;inset:0;z-index:2147483646;pointer-events:none;" +
+      "position:fixed;inset:0;z-index:2147483646;pointer-events:auto;" +
       "background:rgba(0,0,0,.22);display:flex;align-items:flex-start;justify-content:center;padding-top:18px;";
     const card = document.createElement("div");
     card.style.cssText =
@@ -747,7 +631,7 @@
   async function bindCursorPriceAxis(ui) {
     const overlay = document.createElement("div");
     overlay.style.cssText =
-      "position:fixed;inset:0;z-index:2147483646;pointer-events:none;" +
+      "position:fixed;inset:0;z-index:2147483646;pointer-events:auto;" +
       "background:rgba(0,0,0,.22);display:flex;align-items:flex-start;justify-content:center;padding-top:18px;";
     const card = document.createElement("div");
     card.style.cssText =
@@ -1174,6 +1058,103 @@
     );
   }
 
+  function rectIntersectionArea(a, b) {
+    const left = Math.max(a.left, b.left);
+    const right = Math.min(a.right, b.right);
+    const top = Math.max(a.top, b.top);
+    const bottom = Math.min(a.bottom, b.bottom);
+    const w = right - left;
+    const h = bottom - top;
+    if (w <= 0 || h <= 0) return 0;
+    return w * h;
+  }
+
+  function normalizedRegionToClientRect(region) {
+    if (!region) return null;
+    const x = Number(region.x);
+    const y = Number(region.y);
+    const w = Number(region.w);
+    const h = Number(region.h);
+    if (![x, y, w, h].every((n) => Number.isFinite(n))) return null;
+
+    const vw = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1);
+    const vh = Math.max(1, window.innerHeight || document.documentElement.clientHeight || 1);
+    const left = x * vw;
+    const top = y * vh;
+    const right = left + w * vw;
+    const bottom = top + h * vh;
+    if (right - left < 6 || bottom - top < 24) return null;
+    return { left, top, right, bottom };
+  }
+
+  function detectCursorPriceFromAxisElements(ui, regionRect, yBase) {
+    if (!regionRect) return null;
+    if (!Number.isFinite(yBase)) return null;
+
+    const root = ui?.root || null;
+    const xs = [
+      Math.min(regionRect.right - 2, window.innerWidth - 2),
+      Math.min(regionRect.right - 10, window.innerWidth - 2),
+      Math.min(regionRect.right - 20, window.innerWidth - 2)
+    ].filter((n) => Number.isFinite(n));
+    const ys = [yBase, yBase - 1, yBase + 1, yBase - 2, yBase + 2].filter((n) => Number.isFinite(n));
+
+    const candidates = new Set();
+    for (const x of xs) {
+      for (const y of ys) {
+        try {
+          for (const el of document.elementsFromPoint(x, y)) {
+            if (!(el instanceof Element)) continue;
+            if (root && root.contains(el)) continue;
+            candidates.add(el);
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    let best = null;
+    let bestScore = -1e9;
+
+    for (const el of candidates) {
+      const raw =
+        elementTextOrValue(el) ||
+        el.getAttribute?.("aria-label") ||
+        el.getAttribute?.("title") ||
+        el.getAttribute?.("data-value") ||
+        "";
+      const price = extractPrice(raw);
+      if (price == null) continue;
+
+      let rect;
+      try {
+        rect = el.getBoundingClientRect();
+      } catch {
+        continue;
+      }
+      if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+      if (rect.width < 14 || rect.height < 10) continue;
+      if (rect.width > 420 || rect.height > 120) continue;
+
+      const overlapArea = rectIntersectionArea(rect, regionRect);
+      const overlap01 = overlapArea / Math.max(1, rect.width * rect.height);
+      if (overlap01 < 0.05) continue;
+
+      const yCenter = rect.top + rect.height / 2;
+      const yDist = Math.abs(yCenter - yBase);
+      if (yDist > 140) continue;
+
+      const score = scorePriceEl({ el, overlap: overlap01, yDist, preferWhite: true });
+      if (score > bestScore) {
+        bestScore = score;
+        best = price;
+      }
+    }
+
+    return best;
+  }
+
   function detectCursorPriceFromScale(regionRect, yBase) {
     const { left, top, right, bottom } = regionRect;
     const w = right - left;
@@ -1273,7 +1254,7 @@
 
   const CURSOR_STALE_MS = 800;
 
-  function detectCursorPrice(_ui) {
+  function detectCursorPrice(ui) {
     const now = Date.now();
     if (lastFrameCursorPrice != null && now - lastFrameCursorTs < CURSOR_STALE_MS) return lastFrameCursorPrice;
     return null;
@@ -1543,24 +1524,6 @@
       e.stopImmediatePropagation?.();
       setStatus({ wrap }, "connecting", "train mode");
       await bindActiveSymbol({ root, wrap });
-    });
-
-    const cursorBtn = wrap.querySelector(".cursor-btn");
-    cursorBtn?.addEventListener("click", async (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      e.stopImmediatePropagation?.();
-      setStatus({ wrap }, "connecting", "cursor bind");
-      await bindCursorPriceElement({ root, wrap });
-    });
-
-    const priceBtn = wrap.querySelector(".price-btn");
-    priceBtn?.addEventListener("click", async (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      e.stopImmediatePropagation?.();
-      setStatus({ wrap }, "connecting", "price train");
-      await bindCursorPriceAxis({ root, wrap });
     });
 
     const orderButtons = wrap.querySelectorAll(".order-type .toggle-btn");
@@ -2505,11 +2468,20 @@
     "message",
     (e) => {
       const data = e?.data;
-      if (!data || data.__rhwidget !== true || data.type !== "cursor_price") return;
-      const price = Number(data.price);
-      if (!Number.isFinite(price) || price <= 0) return;
-      lastFrameCursorPrice = price;
-      lastFrameCursorTs = Date.now();
+      if (!data || data.__rhwidget !== true) return;
+      if (data.type === "cursor_price") {
+        const price = Number(data.price);
+        if (!Number.isFinite(price) || price <= 0) return;
+        lastFrameCursorPrice = price;
+        lastFrameCursorTs = Date.now();
+        return;
+      }
+      if (data.type === "cursor_mouse") {
+        const x = Number(data.x);
+        const y = Number(data.y);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+        lastMousePos = { x, y };
+      }
     },
     true
   );

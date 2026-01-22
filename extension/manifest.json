@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "RHWidget (Momo Screener)",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Shows Momoscreener tickers on Robinhood Legend and lets you click to activate a symbol.",
   "permissions": ["storage", "scripting"],
   "host_permissions": [
