@@ -14,6 +14,19 @@ DEFAULT_TBODY_XPATH = "/html/body/div/div/div[2]/div/div[2]/div/div[2]/div/table
 
 _SYMBOL_PREFIX_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]*")
 _STAR_CHARS = {
+    # Common star glyphs/emoji (use escapes to avoid source encoding issues).
+    "\u2B50",  # ⭐
+    "\u2605",  # ★
+    "\u2606",  # ☆
+    "\u272A",  # ✪
+    "\u2729",  # ✩
+    "\u272B",  # ✫
+    "\u272C",  # ✬
+    "\u272D",  # ✭
+    "\u272E",  # ✮
+    "\u272F",  # ✯
+    "\u2730",  # ✰
+    "\u2728",  # ✨
     "⭐",
     "★",
     "☆",
@@ -33,6 +46,8 @@ _STAR_CHARS = {
 class Row:
     symbol: str
     values: dict[str, str]
+    has_news: bool = False
+    is_hod: bool = False
 
 
 def _normalize_headers(raw_headers: List[str], column_count: int) -> List[str]:
@@ -115,6 +130,19 @@ def normalize_symbol(raw: str) -> str:
     return m.group(0) if m else ""
 
 
+_HOD_RE = re.compile(r"\bHOD\b", re.IGNORECASE)
+
+
+async def _symbol_cell_has_star(symbol_cell_locator) -> bool:
+    try:
+        # Momoscreener uses a FontAwesome star rendered as an <svg> (no text content).
+        # Be liberal in what we match to survive small DOM changes.
+        sel = "svg[data-icon='star'], [data-icon='star'], .fa-star, [class*='fa-star']"
+        return (await symbol_cell_locator.locator(sel).count()) > 0
+    except Exception:
+        return False
+
+
 async def _iter_table_rows_from_tbody(tbody_locator) -> AsyncIterator:
     row_locators = tbody_locator.locator("tr")
     count = await row_locators.count()
@@ -165,8 +193,12 @@ async def scrape_scanner(
                 continue
             headers = _normalize_headers(raw_headers, len(cells))
             values = {headers[i]: cells[i] for i in range(len(cells))}
-            symbol = normalize_symbol(values.get("Symbol") or values.get("symbol") or cells[0])
-            rows.append(Row(symbol=symbol, values=values))
+            symbol_cell = row.locator("td").first
+            symbol_raw = values.get("Symbol") or values.get("symbol") or cells[0]
+            symbol = normalize_symbol(symbol_raw)
+            has_news = await _symbol_cell_has_star(symbol_cell)
+            is_hod = bool(_HOD_RE.search(str(symbol_raw or "")))
+            rows.append(Row(symbol=symbol, values=values, has_news=has_news, is_hod=is_hod))
 
         await browser.close()
 
@@ -261,8 +293,12 @@ class MomoScreenerWatcher:
                 continue
             headers = _normalize_headers(raw_headers, len(cells))
             values = {headers[i]: cells[i] for i in range(len(cells))}
-            symbol = normalize_symbol(values.get("Symbol") or values.get("symbol") or cells[0])
-            rows.append(Row(symbol=symbol, values=values))
+            symbol_cell = row.locator("td").first
+            symbol_raw = values.get("Symbol") or values.get("symbol") or cells[0]
+            symbol = normalize_symbol(symbol_raw)
+            has_news = await _symbol_cell_has_star(symbol_cell)
+            is_hod = bool(_HOD_RE.search(str(symbol_raw or "")))
+            rows.append(Row(symbol=symbol, values=values, has_news=has_news, is_hod=is_hod))
 
         headers = _normalize_headers(raw_headers, max((len(r.values) for r in rows), default=0))
         return headers, rows

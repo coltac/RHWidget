@@ -54,6 +54,7 @@ The widget header has two small training buttons:
 - **T (Train active symbol):** click this, then drag a box around the on-screen symbol/ticker that represents the current active chart. This lets hotkeys (buy/sell) know which symbol is active.
 - **P (Train cursor price axis):** drag a box around the y-axis price labels area (used to read the crosshair price).
 - **N (News):** toggles a detachable news panel for the active ticker (drag/resize; position is saved).
+- **S (Time & Sales):** toggles a detachable time & sales panel for the active ticker (Alpaca IEX trade prints; drag/resize; position is saved).
 
 Press `Esc` to cancel a training mode.
 
@@ -65,6 +66,7 @@ Configure `.env` (see `.env.example`):
 - `NEWS_LOOKBACK_HOURS` (only use news within this window)
 - `ALPACA_API_KEY` / `ALPACA_API_SECRET` (or `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY`)
 - `LMSTUDIO_BASE_URL` / `LMSTUDIO_MODEL`
+- `RH_CA_BUNDLE` (optional; set if you get `SSL: CERTIFICATE_VERIFY_FAILED` fetching news)
 
 ### Hotkeys
 
@@ -81,9 +83,19 @@ Hotkeys only fire while you are on the Legend page and not typing in an input fi
   - **Sell limit:** `last price - offset`
 
 Buy orders use the widget's **Buy** field: toggle **SH** for shares or **$** for dollars.
-- **$ + Market** converts dollars to a whole-share quantity using the latest quote (rounds down).
+- **$ + Market** sends a buy-by-price (fractional) order (no quote fetch). If **STOP** is enabled, the server waits for the fill and then places a stop for the **whole-share portion** that shows up in your position delta.
+  - Set `RH_BUY_DOLLARS_WHOLE_SHARES=1` to force the slower quote -> whole-shares path (protects the full bought quantity with the stop, assuming the order fills).
 - **$ + Limit** converts dollars to a whole-share quantity at the computed limit price (rounds down).
 Sell orders use your full open position for the active symbol.
+
+### Selling with an open stop-loss
+
+Robinhood can reject a sell if you have an open stop-loss reserving shares (you'll see an "insufficient shares" style error).
+By default the bridge cancels stop-like open sell orders for that symbol before submitting a sell.
+If the stop-loss was placed by this widget, it caches the stop order id and will cancel that id first (faster than scanning all open orders).
+
+Configure via `.env`:
+- `RH_SELL_CANCEL_OPEN=stop` (default), `all`, or `none`
 
 ### Auto stop-loss (optional)
 

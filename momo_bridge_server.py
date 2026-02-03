@@ -6,24 +6,28 @@ import json
 import math
 import os
 import pickle
+import re
+import ssl
+import threading
 import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from momo_screener import DEFAULT_TBODY_XPATH, DEFAULT_URL, MomoScreenerWatcher
 import robin_stocks.robinhood as rh
 from robin_stocks.robinhood.authentication import generate_device_token
 from robin_stocks.robinhood.helper import request_get, request_post, round_price, set_login_state, update_session
-from robin_stocks.robinhood.urls import login_url, positions_url
+from robin_stocks.robinhood.urls import login_url, orders_url, positions_url
 
 load_dotenv()
 
@@ -86,6 +90,9 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
         "rows": [],
         "symbols": [],
         "error": None,
+        "rvol_updated_at": None,
+        "rvol_error": None,
+        "rvol": {},
         "source": {"url": cfg.momo_url, "tbody_xpath": cfg.momo_tbody_xpath},
     }
 
@@ -106,8 +113,90 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
         "prompt_validated": False,
     }
 
+    rh_cache_lock = threading.Lock()
+    rh_cache: dict[str, Any] = {
+        "account_url": None,
+        "instrument_url_by_symbol": {},
+    }
+
+    stop_lock = asyncio.Lock()
+    stop_cache: dict[str, dict[str, Any]] = {}
+
     news_lock = asyncio.Lock()
     news_cache: dict[str, dict[str, Any]] = {}
+
+    _STAR_CHARS = {
+        # Common star glyphs/emoji (use escapes to avoid source encoding issues).
+        "\u2B50",  # ⭐
+        "\u2605",  # ★
+        "\u2606",  # ☆
+        "\u272A",  # ✪
+        "\u2729",  # ✩
+        "\u272B",  # ✫
+        "\u272C",  # ✬
+        "\u272D",  # ✭
+        "\u272E",  # ✮
+        "\u272F",  # ✯
+        "\u2730",  # ✰
+        "\u2728",  # ✨
+        # Mojibake variants we've seen in this repo/console output.
+        "â­",
+        "â˜…",
+        "â˜†",
+        "âœª",
+        "âœ©",
+        "âœ«",
+        "âœ¬",
+        "âœ­",
+        "âœ®",
+        "âœ¯",
+        "âœ°",
+        "âœ¨",
+    }
+    # Match HOD whether Momoscreener formats it as "(HOD)" or just "HOD".
+    _HOD_RE = re.compile(r"\bHOD\b", re.IGNORECASE)
+
+    def _symbol_cell_text(values: dict[str, Any] | None) -> str:
+        if not isinstance(values, dict) or not values:
+            return ""
+        # Prefer explicit symbol headers when present; otherwise use first column value.
+        for k in ("Symbol", "symbol", "Ticker", "ticker"):
+            v = values.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+        first = next(iter(values.values()), "")
+        return first if isinstance(first, str) else str(first or "")
+
+    def _row_flags(values: dict[str, Any] | None) -> tuple[bool, bool]:
+        raw = _symbol_cell_text(values)
+        has_news = any(ch in raw for ch in _STAR_CHARS)
+        is_hod = bool(_HOD_RE.search(raw))
+        return has_news, is_hod
+
+    def _build_https_context() -> ssl.SSLContext | None:
+        ca_bundle = (os.getenv("RH_CA_BUNDLE") or "").strip()
+        if not ca_bundle:
+            ca_bundle = (os.getenv("SSL_CERT_FILE") or os.getenv("REQUESTS_CA_BUNDLE") or "").strip()
+        if not ca_bundle:
+            try:
+                import certifi  # type: ignore
+
+                ca_bundle = certifi.where()
+            except Exception:
+                ca_bundle = ""
+        if not ca_bundle:
+            return None
+        try:
+            return ssl.create_default_context(cafile=ca_bundle)
+        except Exception:
+            return None
+
+    https_context = _build_https_context()
+
+    def _urlopen(req: urllib.request.Request, *, timeout: float):
+        if https_context is not None and str(getattr(req, "full_url", "")).startswith("https://"):
+            return urllib.request.urlopen(req, timeout=timeout, context=https_context)
+        return urllib.request.urlopen(req, timeout=timeout)
 
     def build_login_payload(device_token: str) -> dict[str, Any]:
         return {
@@ -298,11 +387,45 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
                     async with state_lock:
                         state["error"] = None
                     async for headers, rows in watcher.watch():
+                        async with state_lock:
+                            rvol_snap = dict(state.get("rvol") or {})
                         symbols = [r.symbol for r in rows if r.symbol]
                         if cfg.limit > 0:
                             rows = rows[: cfg.limit]
                             symbols = symbols[: cfg.limit]
-                        payload_rows = [{"symbol": r.symbol, "values": r.values} for r in rows]
+                        payload_rows = []
+                        for r in rows:
+                            # Prefer scraper-detected flags (SVG star icon has no text content).
+                            has_news = bool(getattr(r, "has_news", False))
+                            is_hod = bool(getattr(r, "is_hod", False))
+                            if not has_news or not is_hod:
+                                fallback_has_news, fallback_is_hod = _row_flags(r.values)
+                                has_news = has_news or fallback_has_news
+                                is_hod = is_hod or fallback_is_hod
+                            rvol_info = rvol_snap.get(r.symbol) if isinstance(rvol_snap, dict) else None
+                            rvol_pct = None
+                            today_vol = None
+                            if isinstance(rvol_info, dict):
+                                rvol_raw = rvol_info.get("rvol_pct")
+                                try:
+                                    rvol_pct = float(rvol_raw) if rvol_raw is not None else None
+                                except Exception:
+                                    rvol_pct = None
+                                tv_raw = rvol_info.get("today_volume")
+                                try:
+                                    today_vol = int(float(tv_raw or 0))
+                                except Exception:
+                                    today_vol = None
+                            payload_rows.append(
+                                {
+                                    "symbol": r.symbol,
+                                    "values": r.values,
+                                    "has_news": has_news,
+                                    "is_hod": is_hod,
+                                    "rvol_pct": rvol_pct,
+                                    "today_volume": today_vol,
+                                }
+                            )
                         async with state_lock:
                             state["updated_at"] = datetime.now(tz=UTC).isoformat()
                             state["headers"] = headers
@@ -326,6 +449,7 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
     async def _startup() -> None:
         app.state._watcher_task = asyncio.create_task(watcher_loop())
         app.state._auth_task = asyncio.create_task(auth_startup_loop())
+        app.state._rvol_task = asyncio.create_task(rvol_loop())
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
@@ -341,6 +465,13 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
             auth_task.cancel()
             try:
                 await auth_task
+            except asyncio.CancelledError:
+                pass
+        rvol_task = getattr(app.state, "_rvol_task", None)
+        if rvol_task is not None:
+            rvol_task.cancel()
+            try:
+                await rvol_task
             except asyncio.CancelledError:
                 pass
 
@@ -361,6 +492,197 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
         except Exception:
             return None
         return None
+
+    def _rh_cached_account_url() -> str:
+        with rh_cache_lock:
+            cached = rh_cache.get("account_url")
+        if isinstance(cached, str) and cached.strip():
+            return cached.strip()
+        url = rh.profiles.load_account_profile(info="url")
+        if not url:
+            raise RuntimeError("missing_account_url")
+        out = str(url).strip()
+        if not out:
+            raise RuntimeError("missing_account_url")
+        with rh_cache_lock:
+            rh_cache["account_url"] = out
+        return out
+
+    def _safe_float(v: Any) -> float | None:
+        try:
+            f = float(v)
+        except Exception:
+            return None
+        if not math.isfinite(f):
+            return None
+        return f
+
+    def _rh_quote_snapshot(symbol: str) -> dict[str, Any]:
+        sym = (symbol or "").strip().upper()
+        if not sym:
+            raise ValueError("missing_symbol")
+        quotes = rh.stocks.get_quotes(sym) or []
+        q = quotes[0] if isinstance(quotes, list) and quotes else None
+        if not isinstance(q, dict):
+            raise RuntimeError("quote_unavailable")
+        return q
+
+    def _rh_instrument_url(symbol: str, quote: dict[str, Any] | None = None) -> str:
+        sym = (symbol or "").strip().upper()
+        if not sym:
+            raise ValueError("missing_symbol")
+        with rh_cache_lock:
+            cached = (rh_cache.get("instrument_url_by_symbol") or {}).get(sym)
+        if isinstance(cached, str) and cached.strip():
+            return cached.strip()
+
+        inst = None
+        if isinstance(quote, dict):
+            inst = quote.get("instrument")
+        if not inst:
+            instruments = rh.stocks.get_instruments_by_symbols(sym) or []
+            inst0 = instruments[0] if instruments and isinstance(instruments, list) else None
+            inst = inst0.get("url") if isinstance(inst0, dict) else None
+        if not inst or not isinstance(inst, str):
+            raise RuntimeError("instrument_unavailable")
+        inst = inst.strip()
+        with rh_cache_lock:
+            d = rh_cache.get("instrument_url_by_symbol")
+            if not isinstance(d, dict):
+                d = {}
+                rh_cache["instrument_url_by_symbol"] = d
+            d[sym] = inst
+        return inst
+
+    def _submit_stock_order_fast(
+        *,
+        symbol: str,
+        quantity: int,
+        side: str,
+        limit_price: float | None,
+        stop_price: float | None,
+        time_in_force: str,
+        extended_hours: bool,
+        market_hours: str = "regular_hours",
+        quote: dict[str, Any] | None = None,
+    ) -> Any:
+        sym = (symbol or "").strip().upper()
+        if not sym:
+            raise ValueError("missing_symbol")
+        if quantity <= 0:
+            raise ValueError("invalid_qty")
+        side_v = (side or "").strip().lower()
+        if side_v not in {"buy", "sell"}:
+            raise ValueError("invalid_side")
+
+        if quote is None:
+            quote = _rh_quote_snapshot(sym)
+
+        ask = _safe_float(quote.get("ask_price"))
+        bid = _safe_float(quote.get("bid_price"))
+        last = _safe_float(quote.get("last_trade_price")) or _safe_float(quote.get("last_extended_hours_trade_price"))
+
+        order_type = "market"
+        trigger = "immediate"
+        price = None
+        stop_price_v = None
+
+        if limit_price is not None and stop_price is not None:
+            order_type = "limit"
+            trigger = "stop"
+            price = round_price(float(limit_price))
+            stop_price_v = round_price(float(stop_price))
+        elif limit_price is not None:
+            order_type = "limit"
+            price = round_price(float(limit_price))
+        elif stop_price is not None:
+            trigger = "stop"
+            stop_price_v = round_price(float(stop_price))
+            # Robin-stocks sets buy stop price=stop and sell stop price price=None.
+            if side_v == "buy":
+                price = stop_price_v
+        else:
+            # Market order: RH expects a price for buys (robin-stocks uses ask/bid).
+            ref = ask if side_v == "buy" else bid
+            if ref is None or ref <= 0:
+                ref = last
+            if ref is None or ref <= 0:
+                raise RuntimeError("quote_unavailable")
+            price = round_price(float(ref))
+
+        account_url = _rh_cached_account_url()
+        instrument_url = _rh_instrument_url(sym, quote)
+
+        payload: dict[str, Any] = {
+            "account": account_url,
+            "instrument": instrument_url,
+            "symbol": sym,
+            "price": price,
+            "ask_price": round_price(float(ask or price or 0.0)),
+            "bid_ask_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
+            "bid_price": round_price(float(bid or price or 0.0)),
+            "quantity": int(quantity),
+            "ref_id": str(uuid4()),
+            "type": order_type,
+            "stop_price": stop_price_v,
+            "time_in_force": time_in_force,
+            "trigger": trigger,
+            "side": side_v,
+            "market_hours": market_hours,
+            "extended_hours": bool(extended_hours),
+            "order_form_version": 4,
+        }
+
+        if order_type == "market":
+            if trigger != "stop":
+                payload.pop("stop_price", None)
+
+        if market_hours == "regular_hours":
+            if side_v == "buy":
+                # Match robin-stocks behavior: buys in regular hours are submitted as limit orders with a preset collar.
+                payload["preset_percent_limit"] = "0.05"
+                payload["type"] = "limit"
+            elif order_type == "market" and side_v == "sell":
+                payload.pop("price", None)
+        elif market_hours in ("extended_hours", "all_day_hours"):
+            payload["type"] = "limit"
+            payload["quantity"] = int(payload["quantity"])
+
+        url = orders_url()
+        return request_post(url, payload, jsonify_data=True)
+
+    async def _cache_stop_order(symbol: str, order_id: str, stop_price: float | None = None) -> None:
+        sym = (symbol or "").strip().upper()
+        oid = (order_id or "").strip()
+        if not sym or not oid:
+            return
+        payload: dict[str, Any] = {"id": oid, "ts": datetime.now(tz=UTC).isoformat()}
+        if stop_price is not None and math.isfinite(float(stop_price)) and float(stop_price) > 0:
+            payload["stop_price"] = float(stop_price)
+        async with stop_lock:
+            stop_cache[sym] = payload
+
+    async def _get_cached_stop_order_id(symbol: str) -> str | None:
+        sym = (symbol or "").strip().upper()
+        if not sym:
+            return None
+        async with stop_lock:
+            v = stop_cache.get(sym) or {}
+        oid = v.get("id")
+        return oid.strip() if isinstance(oid, str) and oid.strip() else None
+
+    async def _clear_cached_stop_order(symbol: str, order_id: str | None = None) -> None:
+        sym = (symbol or "").strip().upper()
+        if not sym:
+            return
+        async with stop_lock:
+            if order_id is None:
+                stop_cache.pop(sym, None)
+                return
+            cur = stop_cache.get(sym) or {}
+            cur_id = cur.get("id")
+            if isinstance(cur_id, str) and cur_id.strip() == str(order_id).strip():
+                stop_cache.pop(sym, None)
 
     def _parse_datetime(value: str) -> datetime | None:
         if not value:
@@ -416,7 +738,7 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
                 "User-Agent": "RHWidget/0.1 (+local)",
             },
         )
-        with urllib.request.urlopen(req, timeout=12) as resp:
+        with _urlopen(req, timeout=12) as resp:
             data = json.loads(resp.read().decode("utf-8"))
 
         raw_items = []
@@ -456,6 +778,107 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
 
         items.sort(key=sort_key, reverse=True)
         return items
+
+    def _alpaca_stream_endpoint() -> str:
+        endpoint = (os.getenv("ALPACA_WS_ENDPOINT") or "").strip()
+        if not endpoint:
+            feed = (os.getenv("ALPACA_FEED") or os.getenv("ALPACA_DATA_FEED") or "iex").strip()
+            endpoint = f"v2/{feed}"
+        endpoint = endpoint.strip().lstrip("/")
+        return endpoint or "v2/iex"
+
+    def _alpaca_stream_url() -> str:
+        return f"wss://stream.data.alpaca.markets/{_alpaca_stream_endpoint()}"
+
+    def _alpaca_market_keys() -> tuple[str, str]:
+        api_key = (os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID") or "").strip()
+        api_secret = (os.getenv("ALPACA_API_SECRET") or os.getenv("APCA_API_SECRET_KEY") or "").strip()
+        return api_key, api_secret
+
+    async def _queue_put_drop_oldest(queue: asyncio.Queue, item: Any) -> None:
+        try:
+            queue.put_nowait(item)
+            return
+        except asyncio.QueueFull:
+            pass
+        try:
+            _ = queue.get_nowait()
+        except Exception:
+            pass
+        try:
+            queue.put_nowait(item)
+        except Exception:
+            pass
+
+    async def _alpaca_trade_producer(symbol: str, queue: asyncio.Queue, stop: asyncio.Event) -> None:
+        try:
+            import websockets  # type: ignore
+        except Exception as exc:
+            await _queue_put_drop_oldest(queue, {"type": "error", "message": f"missing_dependency: {exc!r}"})
+            return
+
+        api_key, api_secret = _alpaca_market_keys()
+        if not api_key or not api_secret:
+            await _queue_put_drop_oldest(queue, {"type": "error", "message": "missing_alpaca_credentials"})
+            return
+
+        url = _alpaca_stream_url()
+        ssl_ctx = _build_https_context()
+        sym = (symbol or "").strip().upper()
+        if not sym:
+            await _queue_put_drop_oldest(queue, {"type": "error", "message": "missing_symbol"})
+            return
+
+        while not stop.is_set():
+            try:
+                await _queue_put_drop_oldest(queue, {"type": "status", "status": "connecting", "symbol": sym})
+                async with websockets.connect(url, ping_interval=20, ping_timeout=20, ssl=ssl_ctx) as ws:
+                    await ws.send(json.dumps({"action": "auth", "key": api_key, "secret": api_secret}))
+                    await ws.send(json.dumps({"action": "subscribe", "trades": [sym]}))
+                    await _queue_put_drop_oldest(queue, {"type": "status", "status": "subscribed", "symbol": sym})
+
+                    async for raw in ws:
+                        if stop.is_set():
+                            break
+                        try:
+                            payload = json.loads(raw)
+                        except Exception:
+                            continue
+                        msgs = payload if isinstance(payload, list) else [payload]
+                        for msg in msgs:
+                            if not isinstance(msg, dict):
+                                continue
+                            t = msg.get("T")
+                            if t in {"success", "subscription"}:
+                                continue
+                            if t == "error":
+                                await _queue_put_drop_oldest(
+                                    queue,
+                                    {
+                                        "type": "error",
+                                        "code": msg.get("code"),
+                                        "message": msg.get("msg") or msg.get("message") or "alpaca_error",
+                                    },
+                                )
+                                return
+                            if t == "t":
+                                await _queue_put_drop_oldest(
+                                    queue,
+                                    {
+                                        "type": "trade",
+                                        "symbol": msg.get("S") or sym,
+                                        "ts": msg.get("t"),
+                                        "price": msg.get("p"),
+                                        "size": msg.get("s"),
+                                        "exchange": msg.get("x"),
+                                        "id": msg.get("i"),
+                                    },
+                                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await _queue_put_drop_oldest(queue, {"type": "error", "message": repr(exc)})
+                await asyncio.sleep(0.8)
 
     def _extract_json_object(text: str) -> dict[str, Any] | None:
         if not text:
@@ -530,7 +953,7 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
             headers={"Content-Type": "application/json", "Accept": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with _urlopen(req, timeout=20) as resp:
             data = json.loads(resp.read().decode("utf-8"))
 
         content = ""
@@ -584,6 +1007,17 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
         raw = (os.getenv(name) or "").strip()
         return raw or default
 
+    def _refresh_unconfirmed_orders(order_type: str) -> bool:
+        raw = (os.getenv("RH_REFRESH_UNCONFIRMED") or "").strip().lower()
+        if not raw or raw == "auto":
+            return order_type == "limit"
+        return raw in {"1", "true", "t", "yes", "y", "on"}
+
+    def _fast_orders_enabled() -> bool:
+        # robin_stocks' built-in order helpers call multiple quote endpoints per order.
+        # This project uses a faster single-quote snapshot + direct orders POST by default.
+        return _env_bool("RH_FAST_ORDERS", True)
+
     def _auto_stop_config(payload: BuyRequest) -> dict[str, Any]:
         enabled = payload.auto_stop if payload.auto_stop is not None else _env_bool("AUTO_STOP_ENABLED", False)
         max_wait_s = _env_float("AUTO_STOP_MAX_WAIT_S", 12.0)
@@ -595,6 +1029,113 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
             "alpaca_feed": alpaca_feed,
             "alpaca_data_base": alpaca_data_base,
         }
+
+    def _buy_by_price_allows_auto_stop(payload: BuyRequest) -> bool:
+        # When buying by dollars with a market order, we can submit a faster fractional-by-price order.
+        # Stop-losses can only be placed for whole shares with this implementation, so we place the stop
+        # after the fill for the whole-share portion that appears in the position.
+        #
+        # Setting RH_BUY_DOLLARS_WHOLE_SHARES=1 forces the older quote->whole-share path.
+        if _env_bool("RH_BUY_DOLLARS_WHOLE_SHARES", False):
+            return False
+        return normalize_order_type(payload.order_type) == "market" and payload.amount_usd is not None
+
+    def _sell_cancel_mode() -> str:
+        # Controls whether we cancel open sell orders (typically stop-losses) before submitting a sell.
+        # - "stop" (default): cancel only stop-like sell orders (trigger=stop / stop_price / trailing_*).
+        # - "all": cancel any open *sell* order for the symbol.
+        # - "none"/"0": don't cancel anything (may cause insufficient shares errors).
+        raw = (os.getenv("RH_SELL_CANCEL_OPEN") or "").strip().lower()
+        if not raw:
+            raw = "stop"
+        if raw in {"0", "off", "false", "none", "no"}:
+            return "none"
+        if raw in {"1", "true", "on", "yes", "y"}:
+            return "stop"
+        if raw in {"all", "any"}:
+            return "all"
+        if raw in {"stop", "stops", "stoploss", "stop_loss"}:
+            return "stop"
+        return "stop"
+
+    def _is_stop_like_order(order: dict[str, Any]) -> bool:
+        trigger = str(order.get("trigger") or "").strip().lower()
+        if trigger == "stop":
+            return True
+        if order.get("stop_price") not in (None, "", "0", 0):
+            return True
+        if order.get("trailing_amount") not in (None, "", "0", 0):
+            return True
+        if order.get("trailing_percent") not in (None, "", "0", 0):
+            return True
+        typ = str(order.get("type") or "").strip().lower()
+        if "stop" in typ or "trail" in typ:
+            return True
+        return False
+
+    def cancel_open_sell_orders_for_symbol(symbol: str, mode: str) -> dict[str, Any]:
+        sym = (symbol or "").strip().upper()
+        if not sym:
+            return {"ok": False, "error": "missing_symbol", "canceled": [], "attempted": 0}
+        mode_v = (mode or "").strip().lower()
+        if mode_v not in {"stop", "all"}:
+            return {"ok": True, "mode": "none", "canceled": [], "attempted": 0}
+
+        inst_url = None
+        try:
+            inst_url = _rh_instrument_url(sym)
+        except Exception:
+            inst_url = None
+
+        canceled: list[str] = []
+        attempted = 0
+        errors: list[str] = []
+
+        orders = rh.orders.get_all_open_stock_orders() or []
+        if not isinstance(orders, list):
+            orders = []
+
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            side = str(o.get("side") or "").strip().lower()
+            if side != "sell":
+                continue
+            o_sym = str(o.get("symbol") or "").strip().upper()
+            if o_sym and o_sym != sym:
+                continue
+            if not o_sym and inst_url and str(o.get("instrument") or "").strip() != inst_url:
+                continue
+            if mode_v == "stop" and not _is_stop_like_order(o):
+                continue
+
+            order_id = o.get("id")
+            if not isinstance(order_id, str) or not order_id.strip():
+                continue
+            order_id = order_id.strip()
+            attempted += 1
+            try:
+                rh.orders.cancel_stock_order(order_id)
+                canceled.append(order_id)
+            except Exception as exc:
+                errors.append(f"{order_id}:{type(exc).__name__}")
+
+        return {"ok": not errors, "mode": mode_v, "canceled": canceled, "attempted": attempted, "errors": errors}
+
+    def _is_insufficient_shares_error(detail: str | None) -> bool:
+        if not detail:
+            return False
+        s = str(detail).strip().lower()
+        if not s:
+            return False
+        needles = [
+            "insufficient",
+            "not enough shares",
+            "not enough shares to",
+            "exceeds available",
+            "insufficient shares",
+        ]
+        return any(n in s for n in needles)
 
     def _interval_seconds(interval: str) -> int | None:
         v = (interval or "").strip().lower()
@@ -643,7 +1184,7 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
                 "User-Agent": "RHWidget/0.1 (+local)",
             },
         )
-        with urllib.request.urlopen(req, timeout=12) as resp:
+        with _urlopen(req, timeout=12) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         bars = data.get("bars") if isinstance(data, dict) else None
         if not isinstance(bars, list) or not bars:
@@ -672,6 +1213,254 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
                 best_dt = t
                 best_low = low
         return best_low
+
+    def _alpaca_credentials() -> tuple[str, str] | None:
+        api_key = (os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID") or "").strip()
+        api_secret = (os.getenv("ALPACA_API_SECRET") or os.getenv("APCA_API_SECRET_KEY") or "").strip()
+        if not api_key or not api_secret:
+            return None
+        return api_key, api_secret
+
+    def _alpaca_feed(feed: str) -> str:
+        f = (feed or "").strip().lower() or "iex"
+        return f if f in {"iex", "sip"} else "iex"
+
+    def fetch_alpaca_bars_multi(
+        symbols: list[str],
+        *,
+        start: datetime,
+        end: datetime,
+        timeframe: str,
+        data_base: str,
+        feed: str,
+        limit: int = 10_000,
+    ) -> dict[str, list[dict[str, Any]]]:
+        creds = _alpaca_credentials()
+        if not creds:
+            raise RuntimeError("missing_alpaca_credentials")
+        api_key, api_secret = creds
+
+        base = (data_base or "").strip() or "https://data.alpaca.markets/v2"
+        feed = _alpaca_feed(feed)
+        if not symbols:
+            return {}
+        # Alpaca paginates with page_token; keep pulling until empty.
+        page_token: str | None = None
+        out: dict[str, list[dict[str, Any]]] = {}
+        for s in symbols:
+            out[str(s).strip().upper()] = []
+
+        for _ in range(20):  # hard cap pages to avoid infinite loops
+            params = {
+                "symbols": ",".join(symbols),
+                "timeframe": timeframe,
+                "start": start.isoformat().replace("+00:00", "Z"),
+                "end": end.isoformat().replace("+00:00", "Z"),
+                "limit": str(int(limit)),
+                "adjustment": "raw",
+                "feed": feed,
+            }
+            if page_token:
+                params["page_token"] = page_token
+            url = f"{base.rstrip('/')}/stocks/bars?{urllib.parse.urlencode(params)}"
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "APCA-API-KEY-ID": api_key,
+                    "APCA-API-SECRET-KEY": api_secret,
+                    "Accept": "application/json",
+                    "User-Agent": "RHWidget/0.1 (+local)",
+                },
+            )
+            with _urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            bars_by_symbol = data.get("bars") if isinstance(data, dict) else None
+            if isinstance(bars_by_symbol, dict):
+                for sym, bars in bars_by_symbol.items():
+                    if not isinstance(sym, str) or not isinstance(bars, list):
+                        continue
+                    key = sym.strip().upper()
+                    if key not in out:
+                        out[key] = []
+                    out[key].extend([b for b in bars if isinstance(b, dict)])
+            page_token = data.get("next_page_token") if isinstance(data, dict) else None
+            if not page_token:
+                break
+        return out
+
+    def _parse_hhmm(value: str, default: str = "04:00") -> tuple[int, int]:
+        s = (value or "").strip() or default
+        try:
+            parts = s.split(":")
+            hh = int(parts[0])
+            mm = int(parts[1]) if len(parts) > 1 else 0
+            hh = min(max(hh, 0), 23)
+            mm = min(max(mm, 0), 59)
+            return hh, mm
+        except Exception:
+            return _parse_hhmm(default, default=default)
+
+    def _nth_weekday_of_month(year: int, month: int, weekday: int, n: int) -> datetime:
+        # weekday: Monday=0 .. Sunday=6
+        first = datetime(year, month, 1, tzinfo=UTC)
+        delta = (weekday - first.weekday()) % 7
+        day = 1 + delta + (n - 1) * 7
+        return datetime(year, month, day, tzinfo=UTC)
+
+    def _us_eastern_offset(dt_utc: datetime) -> timedelta:
+        # US/Eastern DST rules (since 2007): starts 2nd Sunday in March 02:00 local, ends 1st Sunday in Nov 02:00 local.
+        # Compute boundaries in UTC:
+        # - DST starts at 02:00 EST (UTC-5) => 07:00 UTC
+        # - DST ends at 02:00 EDT (UTC-4) => 06:00 UTC
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=UTC)
+        year = dt_utc.year
+        second_sunday_march_utc = _nth_weekday_of_month(year, 3, weekday=6, n=2)  # Sunday
+        first_sunday_nov_utc = _nth_weekday_of_month(year, 11, weekday=6, n=1)  # Sunday
+        dst_start_utc = second_sunday_march_utc.replace(hour=7, minute=0, second=0, microsecond=0)
+        dst_end_utc = first_sunday_nov_utc.replace(hour=6, minute=0, second=0, microsecond=0)
+        if dst_start_utc <= dt_utc < dst_end_utc:
+            return timedelta(hours=-4)
+        return timedelta(hours=-5)
+
+    def _to_us_eastern(dt_utc: datetime) -> datetime:
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=UTC)
+        off = _us_eastern_offset(dt_utc)
+        return dt_utc.astimezone(timezone(off))
+
+    def _et_local_to_utc(local_naive: datetime) -> datetime:
+        # Convert an ET local naive datetime to UTC using our DST rules.
+        # Try EDT first then EST; for our configured session start times (04:00/09:30) it's unambiguous.
+        guess_edt = local_naive.replace(tzinfo=timezone(timedelta(hours=-4))).astimezone(UTC)
+        if _us_eastern_offset(guess_edt) == timedelta(hours=-4):
+            return guess_edt
+        return local_naive.replace(tzinfo=timezone(timedelta(hours=-5))).astimezone(UTC)
+
+    async def rvol_loop() -> None:
+        refresh_s = _env_float("RVOL_REFRESH_S", 60.0)
+        refresh_s = min(max(refresh_s, 5.0), 600.0)
+        lookback_days = int(_env_float("RVOL_LOOKBACK_DAYS", 20))
+        lookback_days = min(max(lookback_days, 3), 60)
+        timeframe = _env_str("RVOL_TIMEFRAME", "5Min")
+        data_base = _env_str("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets/v2")
+        feed = _env_str("ALPACA_DATA_FEED", "iex")
+        start_hh, start_mm = _parse_hhmm(_env_str("RVOL_SESSION_START_ET", "04:00"), default="04:00")
+
+        while True:
+            try:
+                async with state_lock:
+                    symbols = list(state.get("symbols") or [])
+                symbols = [str(s).strip().upper() for s in symbols if str(s).strip()]
+                symbols = list(dict.fromkeys(symbols))
+                if not symbols:
+                    # On startup the watcher populates symbols shortly after boot; don't sleep a full refresh period.
+                    await asyncio.sleep(min(2.0, refresh_s))
+                    continue
+
+                now = datetime.now(tz=UTC)
+                now_et = _to_us_eastern(now)
+                today_et = now_et.date()
+                session_start_today_utc = _et_local_to_utc(datetime(today_et.year, today_et.month, today_et.day, start_hh, start_mm))
+                elapsed = now - session_start_today_utc
+                if elapsed.total_seconds() < 0:
+                    elapsed = timedelta(seconds=0)
+                # Cap elapsed to 16 hours to avoid weird values (weekends/off-hours).
+                elapsed = min(elapsed, timedelta(hours=16))
+
+                # Pull enough history to cover weekends/holidays.
+                start_range = now - timedelta(days=max(lookback_days * 3, 30))
+                end_range = now
+
+                merged: dict[str, dict[str, Any]] = {}
+                # Chunk to avoid URL length issues.
+                for i in range(0, len(symbols), 100):
+                    chunk = symbols[i : i + 100]
+                    bars_by_symbol = await asyncio.to_thread(
+                        fetch_alpaca_bars_multi,
+                        chunk,
+                        start=start_range,
+                        end=end_range,
+                        timeframe=timeframe,
+                        data_base=data_base,
+                        feed=feed,
+                    )
+
+                    for sym in chunk:
+                        bars = bars_by_symbol.get(sym) if isinstance(bars_by_symbol, dict) else None
+                        if not isinstance(bars, list) or not bars:
+                            merged[sym] = {
+                                "today_volume": 0,
+                                "expected_volume": None,
+                                "rvol_pct": None,
+                                "mode": "time_adjusted",
+                            }
+                            continue
+
+                        # Sum volume from session start to (session start + elapsed) for each day.
+                        sums_by_day: dict[str, int] = {}
+                        session_start_cache: dict[str, datetime] = {}
+                        for b in bars:
+                            if not isinstance(b, dict):
+                                continue
+                            t = _parse_datetime(str(b.get("t") or ""))
+                            if not t:
+                                continue
+                            v_raw = b.get("v")
+                            if v_raw is None:
+                                v_raw = b.get("volume")
+                            try:
+                                v = int(float(v_raw or 0))
+                            except Exception:
+                                continue
+                            if v <= 0:
+                                continue
+
+                            t = t.astimezone(UTC)
+                            t_et = _to_us_eastern(t)
+                            day_key = t_et.date().isoformat()
+                            session_start_utc = session_start_cache.get(day_key)
+                            if session_start_utc is None:
+                                d = t_et.date()
+                                session_start_utc = _et_local_to_utc(datetime(d.year, d.month, d.day, start_hh, start_mm))
+                                session_start_cache[day_key] = session_start_utc
+                            cutoff_utc = session_start_utc + elapsed
+                            if t < session_start_utc or t > cutoff_utc:
+                                continue
+                            sums_by_day[day_key] = int(sums_by_day.get(day_key, 0) + v)
+
+                        today_key = today_et.isoformat()
+                        today_sum = int(sums_by_day.get(today_key, 0))
+
+                        # Use the most recent lookback_days with data (excluding today).
+                        prev_keys = sorted(k for k in sums_by_day.keys() if k != today_key)
+                        prev_vals = [int(sums_by_day[k]) for k in prev_keys if int(sums_by_day[k]) > 0]
+                        prev_vals = prev_vals[-lookback_days:]
+                        expected = (float(sum(prev_vals)) / float(len(prev_vals))) if prev_vals else None
+                        rvol_pct = (float(today_sum) / float(expected) * 100.0) if expected and expected > 0 else None
+
+                        merged[sym] = {
+                            "today_volume": today_sum,
+                            "expected_volume": expected,
+                            "rvol_pct": rvol_pct,
+                            "mode": "time_adjusted",
+                            "timeframe": timeframe,
+                            "session_start_et": f"{start_hh:02d}:{start_mm:02d}",
+                            "lookback_days": lookback_days,
+                        }
+
+                async with state_lock:
+                    state["rvol"] = merged
+                    state["rvol_updated_at"] = datetime.now(tz=UTC).isoformat()
+                    state["rvol_error"] = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                async with state_lock:
+                    state["rvol_error"] = repr(exc)
+                await asyncio.sleep(min(refresh_s, 30.0))
+                continue
+            await asyncio.sleep(refresh_s)
 
     def get_prev_candle_low(symbol: str, interval: str, span: str, bounds: str) -> float | None:
         interval_s = _interval_seconds(interval)
@@ -758,6 +1547,8 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
                     order = await _refresh_stock_order(_require_order_ok(result))
                     order_id = order.get("id") or "-"
                     state = order.get("state") or "-"
+                    if isinstance(order.get("id"), str) and order.get("id") and str(state) not in {"rejected", "failed", "canceled"}:
+                        await _cache_stop_order(symbol, str(order["id"]), stop_price=float(stop_price))
 
                     info: Any = None
                     try:
@@ -788,11 +1579,17 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
 
     def get_position_qty(symbol: str) -> float:
         try:
-            instruments = rh.stocks.get_instruments_by_symbols(symbol) or []
-            instrument = instruments[0] if instruments else None
-            inst_url = instrument.get("url") if isinstance(instrument, dict) else None
+            inst_url: str | None = None
+            try:
+                inst_url = _rh_instrument_url(symbol)
+            except Exception:
+                inst_url = None
             if not inst_url:
-                return 0.0
+                instruments = rh.stocks.get_instruments_by_symbols(symbol) or []
+                instrument = instruments[0] if instruments else None
+                inst_url = instrument.get("url") if isinstance(instrument, dict) else None
+                if not inst_url:
+                    return 0.0
             positions = rh.account.get_open_stock_positions() or []
             for pos in positions:
                 if pos.get("instrument") == inst_url:
@@ -927,6 +1724,49 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
             headers={"Cache-Control": "no-store"},
         )
 
+    @app.get("/api/tas/stream")
+    async def time_and_sales_stream(request: Request, symbol: str = Query(...)) -> StreamingResponse:
+        sym = (symbol or "").strip().upper()
+        if not sym or sym in {"-", "â€”"}:
+            raise HTTPException(status_code=400, detail="missing_symbol")
+
+        api_key, api_secret = _alpaca_market_keys()
+        if not api_key or not api_secret:
+            raise HTTPException(status_code=502, detail="missing_alpaca_credentials")
+
+        queue: asyncio.Queue = asyncio.Queue(maxsize=600)
+        stop = asyncio.Event()
+        producer = asyncio.create_task(_alpaca_trade_producer(sym, queue, stop))
+
+        async def gen():
+            try:
+                yield f"data: {json.dumps({'type':'hello','symbol':sym}, separators=(',',':'))}\n\n"
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        item = await asyncio.wait_for(queue.get(), timeout=15.0)
+                        yield f"data: {json.dumps(item, separators=(',',':'))}\n\n"
+                    except asyncio.TimeoutError:
+                        yield ": keep-alive\n\n"
+            finally:
+                stop.set()
+                producer.cancel()
+                try:
+                    await producer
+                except Exception:
+                    pass
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-store",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     @app.get("/api/auth/status")
     async def auth_status() -> JSONResponse:
         snapshot = await auth_snapshot()
@@ -979,12 +1819,17 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
         symbol = (payload.symbol or "").strip().upper()
         if not symbol:
             raise HTTPException(status_code=400, detail="missing_symbol")
-        before_qty = await asyncio.to_thread(get_position_qty, symbol)
         order_type = normalize_order_type(payload.order_type)
         auto_stop_cfg = _auto_stop_config(payload)
         if auto_stop_cfg.get("enabled") and payload.stop_price is None and payload.stop_ref_price is None:
             raise HTTPException(status_code=400, detail="missing_stop_ref_price")
+        before_qty = 0.0
+        before_qty_task: asyncio.Task | None = None
+        if auto_stop_cfg.get("enabled"):
+            # Fetch baseline position concurrently with any quote fetch to reduce latency.
+            before_qty_task = asyncio.create_task(asyncio.to_thread(get_position_qty, symbol))
         stop_info: dict[str, Any] | None = None
+        intended_qty = 0
 
         if payload.amount_usd is not None:
             amount_usd = float(payload.amount_usd or 0)
@@ -994,7 +1839,8 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
             if order_type == "limit":
                 if payload.limit_offset is not None:
                     quote_start = time.monotonic()
-                    last = await asyncio.to_thread(get_latest_price, symbol)
+                    quote = await asyncio.to_thread(_rh_quote_snapshot, symbol)
+                    last = _safe_float((quote or {}).get("last_trade_price")) or _safe_float((quote or {}).get("ask_price"))
                     print(f"[trade] buy quote {symbol} {time.monotonic() - quote_start:.3f}s")
                     if last is None:
                         raise HTTPException(status_code=502, detail="quote_unavailable")
@@ -1012,24 +1858,70 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
                 if qty_whole <= 0:
                     raise HTTPException(status_code=400, detail="amount_too_small_for_limit")
                 print(f"[trade] buy dollars->shares {symbol} ${amount_usd:.2f} @ {limit:.4f} => {qty_whole} sh")
+                if before_qty_task is not None:
+                    before_qty = float(await before_qty_task)
+                    before_qty_task = None
                 order_start = time.monotonic()
-                result = await asyncio.to_thread(rh.orders.order_buy_limit, symbol, qty_whole, limit, None, "gfd")
+                if _fast_orders_enabled():
+                    result = await asyncio.to_thread(
+                        _submit_stock_order_fast,
+                        symbol=symbol,
+                        quantity=qty_whole,
+                        side="buy",
+                        limit_price=float(limit),
+                        stop_price=None,
+                        time_in_force="gfd",
+                        extended_hours=False,
+                        quote=locals().get("quote"),
+                    )
+                else:
+                    result = await asyncio.to_thread(rh.orders.order_buy_limit, symbol, qty_whole, limit, None, "gfd")
                 print(f"[trade] buy limit submit {symbol} {time.monotonic() - order_start:.3f}s")
                 intended_qty = int(qty_whole)
             else:
-                quote_start = time.monotonic()
-                last = await asyncio.to_thread(get_latest_price, symbol)
-                print(f"[trade] buy quote {symbol} {time.monotonic() - quote_start:.3f}s")
-                if last is None or last <= 0:
-                    raise HTTPException(status_code=502, detail="quote_unavailable")
-                qty_whole = int(math.floor(amount_usd / float(last)))
-                if qty_whole <= 0:
-                    raise HTTPException(status_code=400, detail="amount_too_small_for_market")
-                print(f"[trade] buy dollars->shares {symbol} ${amount_usd:.2f} @ {last:.4f} => {qty_whole} sh")
-                order_start = time.monotonic()
-                result = await asyncio.to_thread(rh.orders.order_buy_market, symbol, qty_whole, None, "gfd")
-                print(f"[trade] buy market submit {symbol} {time.monotonic() - order_start:.3f}s")
-                intended_qty = int(qty_whole)
+                # Fast path for market buys by dollars: submit by-price (fractional) without fetching a quote.
+                # If auto-stop is enabled, we place the stop after the fill for the whole-share portion that
+                # appears in the position delta.
+                if _buy_by_price_allows_auto_stop(payload):
+                    amount_usd = round(float(amount_usd), 2)
+                    if amount_usd < 0.01:
+                        raise HTTPException(status_code=400, detail="amount_too_small_for_market")
+                    order_start = time.monotonic()
+                    result = await asyncio.to_thread(rh.orders.order_buy_fractional_by_price, symbol, amount_usd)
+                    print(f"[trade] buy market $ submit {symbol} {time.monotonic() - order_start:.3f}s")
+                    if auto_stop_cfg.get("enabled"):
+                        intended_qty = 1_000_000_000  # protect all filled whole shares (position delta limits).
+                else:
+                    quote_start = time.monotonic()
+                    quote = await asyncio.to_thread(_rh_quote_snapshot, symbol)
+                    last = _safe_float((quote or {}).get("ask_price")) or _safe_float((quote or {}).get("last_trade_price"))
+                    print(f"[trade] buy quote {symbol} {time.monotonic() - quote_start:.3f}s")
+                    if last is None or last <= 0:
+                        raise HTTPException(status_code=502, detail="quote_unavailable")
+                    qty_whole = int(math.floor(amount_usd / float(last)))
+                    if qty_whole <= 0:
+                        raise HTTPException(status_code=400, detail="amount_too_small_for_market")
+                    print(f"[trade] buy dollars->shares {symbol} ${amount_usd:.2f} @ {last:.4f} => {qty_whole} sh")
+                    if before_qty_task is not None:
+                        before_qty = float(await before_qty_task)
+                        before_qty_task = None
+                    order_start = time.monotonic()
+                    if _fast_orders_enabled():
+                        result = await asyncio.to_thread(
+                            _submit_stock_order_fast,
+                            symbol=symbol,
+                            quantity=qty_whole,
+                            side="buy",
+                            limit_price=None,
+                            stop_price=None,
+                            time_in_force="gfd",
+                            extended_hours=False,
+                            quote=quote,
+                        )
+                    else:
+                        result = await asyncio.to_thread(rh.orders.order_buy_market, symbol, qty_whole, None, "gfd")
+                    print(f"[trade] buy market submit {symbol} {time.monotonic() - order_start:.3f}s")
+                    intended_qty = int(qty_whole)
         else:
             qty = float(payload.qty or 0)
             if qty <= 0:
@@ -1040,7 +1932,8 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
             if order_type == "limit":
                 if payload.limit_offset is not None:
                     quote_start = time.monotonic()
-                    last = await asyncio.to_thread(get_latest_price, symbol)
+                    quote = await asyncio.to_thread(_rh_quote_snapshot, symbol)
+                    last = _safe_float((quote or {}).get("last_trade_price")) or _safe_float((quote or {}).get("ask_price"))
                     print(f"[trade] buy quote {symbol} {time.monotonic() - quote_start:.3f}s")
                     if last is None:
                         raise HTTPException(status_code=502, detail="quote_unavailable")
@@ -1052,16 +1945,52 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
                 if limit <= 0:
                     raise HTTPException(status_code=400, detail="invalid_limit_price")
                 limit = round_price(limit)
+                if before_qty_task is not None:
+                    before_qty = float(await before_qty_task)
+                    before_qty_task = None
                 order_start = time.monotonic()
-                result = await asyncio.to_thread(rh.orders.order_buy_limit, symbol, qty_whole, limit, None, "gfd")
+                if _fast_orders_enabled():
+                    result = await asyncio.to_thread(
+                        _submit_stock_order_fast,
+                        symbol=symbol,
+                        quantity=qty_whole,
+                        side="buy",
+                        limit_price=float(limit),
+                        stop_price=None,
+                        time_in_force="gfd",
+                        extended_hours=False,
+                        quote=locals().get("quote"),
+                    )
+                else:
+                    result = await asyncio.to_thread(rh.orders.order_buy_limit, symbol, qty_whole, limit, None, "gfd")
                 print(f"[trade] buy limit submit {symbol} {time.monotonic() - order_start:.3f}s")
             else:
+                if before_qty_task is not None:
+                    before_qty = float(await before_qty_task)
+                    before_qty_task = None
                 order_start = time.monotonic()
-                result = await asyncio.to_thread(rh.orders.order_buy_market, symbol, qty_whole, None, "gfd")
+                if _fast_orders_enabled():
+                    result = await asyncio.to_thread(
+                        _submit_stock_order_fast,
+                        symbol=symbol,
+                        quantity=qty_whole,
+                        side="buy",
+                        limit_price=None,
+                        stop_price=None,
+                        time_in_force="gfd",
+                        extended_hours=False,
+                        quote=None,
+                    )
+                else:
+                    result = await asyncio.to_thread(rh.orders.order_buy_market, symbol, qty_whole, None, "gfd")
                 print(f"[trade] buy market submit {symbol} {time.monotonic() - order_start:.3f}s")
             intended_qty = int(qty_whole)
 
-        if auto_stop_cfg.get("enabled") and intended_qty > 0:
+        if before_qty_task is not None:
+            before_qty = float(await before_qty_task)
+            before_qty_task = None
+
+        if auto_stop_cfg.get("enabled"):
             try:
                 explicit_stop = float(payload.stop_price) if payload.stop_price is not None else None
                 ref_price = float(payload.stop_ref_price) if payload.stop_ref_price is not None else None
@@ -1094,7 +2023,8 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
         else:
             stop_info = {"enabled": False}
         print(f"[trade] buy total {symbol} {time.monotonic() - start_ts:.3f}s")
-        order = await _refresh_stock_order(_require_order_ok(result))
+        order0 = _require_order_ok(result)
+        order = await _refresh_stock_order(order0) if _refresh_unconfirmed_orders(order_type) else order0
         if stop_info and stop_info.get("enabled") and stop_info.get("status") == "pending":
             asyncio.create_task(
                 place_auto_stop_after_buy(
@@ -1114,6 +2044,29 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
         symbol = (payload.symbol or "").strip().upper()
         if not symbol:
             raise HTTPException(status_code=400, detail="missing_symbol")
+        preflight: dict[str, Any] | None = None
+        mode = _sell_cancel_mode()
+        cancel_task: asyncio.Task | None = None
+
+        cached_stop_id = await _get_cached_stop_order_id(symbol)
+        if cached_stop_id:
+            preflight = {"mode": mode, "cached_stop_id": cached_stop_id, "canceled": [], "attempted": 0}
+
+            async def _cancel_cached() -> dict[str, Any]:
+                try:
+                    await asyncio.to_thread(rh.orders.cancel_stock_order, cached_stop_id)
+                    await _clear_cached_stop_order(symbol, cached_stop_id)
+                    return {"ok": True, "canceled": [cached_stop_id], "attempted": 1}
+                except Exception as exc:
+                    return {"ok": False, "error": repr(exc), "canceled": [], "attempted": 1}
+
+            cancel_task = asyncio.create_task(_cancel_cached())
+        elif mode != "none":
+            try:
+                preflight = await asyncio.to_thread(cancel_open_sell_orders_for_symbol, symbol, mode)
+            except Exception as exc:
+                preflight = {"ok": False, "mode": mode, "error": repr(exc), "canceled": [], "attempted": 0}
+
         qty = await asyncio.to_thread(get_position_qty, symbol)
         if qty <= 0:
             raise HTTPException(status_code=400, detail="no_position")
@@ -1121,7 +2074,8 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
         if order_type == "limit":
             if payload.limit_offset is not None:
                 quote_start = time.monotonic()
-                last = await asyncio.to_thread(get_latest_price, symbol)
+                quote = await asyncio.to_thread(_rh_quote_snapshot, symbol)
+                last = _safe_float((quote or {}).get("last_trade_price")) or _safe_float((quote or {}).get("bid_price"))
                 print(f"[trade] sell quote {symbol} {time.monotonic() - quote_start:.3f}s")
                 if last is None:
                     raise HTTPException(status_code=502, detail="quote_unavailable")
@@ -1137,20 +2091,84 @@ def create_app(cfg: BridgeConfig, auth_cfg: AuthConfig) -> FastAPI:
             if qty_whole <= 0:
                 raise HTTPException(status_code=400, detail="no_whole_shares_for_limit")
             order_start = time.monotonic()
-            result = await asyncio.to_thread(rh.orders.order_sell_limit, symbol, qty_whole, limit, None, "gfd")
+            if _fast_orders_enabled():
+                result = await asyncio.to_thread(
+                    _submit_stock_order_fast,
+                    symbol=symbol,
+                    quantity=qty_whole,
+                    side="sell",
+                    limit_price=float(limit),
+                    stop_price=None,
+                    time_in_force="gfd",
+                    extended_hours=False,
+                    quote=locals().get("quote"),
+                )
+            else:
+                result = await asyncio.to_thread(rh.orders.order_sell_limit, symbol, qty_whole, limit, None, "gfd")
             print(f"[trade] sell limit submit {symbol} {time.monotonic() - order_start:.3f}s")
         else:
             qty_is_whole = abs(qty - round(qty)) < 1e-6
-            order_start = time.monotonic()
-            if qty_is_whole:
-                result = await asyncio.to_thread(rh.orders.order_sell_market, symbol, int(round(qty)), None, "gfd")
-            else:
-                qty_frac = round(float(qty), 6)
-                result = await asyncio.to_thread(rh.orders.order_sell_fractional_by_quantity, symbol, qty_frac)
-            print(f"[trade] sell market submit {symbol} {time.monotonic() - order_start:.3f}s")
+            max_attempts = 3
+            delays = (0.0, 0.18, 0.35)
+            result: Any = None
+            for attempt in range(max_attempts):
+                if attempt < len(delays) and delays[attempt] > 0:
+                    await asyncio.sleep(delays[attempt])
+
+                order_start = time.monotonic()
+                if qty_is_whole:
+                    if _fast_orders_enabled():
+                        result = await asyncio.to_thread(
+                            _submit_stock_order_fast,
+                            symbol=symbol,
+                            quantity=int(round(qty)),
+                            side="sell",
+                            limit_price=None,
+                            stop_price=None,
+                            time_in_force="gfd",
+                            extended_hours=False,
+                            quote=None,
+                        )
+                    else:
+                        result = await asyncio.to_thread(rh.orders.order_sell_market, symbol, int(round(qty)), None, "gfd")
+                else:
+                    qty_frac = round(float(qty), 6)
+                    result = await asyncio.to_thread(rh.orders.order_sell_fractional_by_quantity, symbol, qty_frac)
+                print(f"[trade] sell market submit {symbol} {time.monotonic() - order_start:.3f}s")
+
+                detail = _order_error_detail(result)
+                _, _, reject_reason = _order_state(result)
+                merged_detail = reject_reason or detail
+                if _is_insufficient_shares_error(merged_detail) and attempt + 1 < max_attempts:
+                    cancel_info: dict[str, Any] | None = None
+                    if cancel_task is not None and not cancel_task.done():
+                        try:
+                            cancel_info = await cancel_task
+                            if isinstance(preflight, dict) and isinstance(cancel_info, dict):
+                                preflight["cached_cancel"] = cancel_info
+                        except Exception:
+                            pass
+                    should_fallback_scan = mode != "none" and attempt == 0 and (
+                        not cached_stop_id or (isinstance(cancel_info, dict) and cancel_info.get("ok") is False)
+                    )
+                    if should_fallback_scan:
+                        try:
+                            preflight = await asyncio.to_thread(cancel_open_sell_orders_for_symbol, symbol, mode)
+                        except Exception:
+                            pass
+                    continue
+                break
         print(f"[trade] sell total {symbol} {time.monotonic() - start_ts:.3f}s")
-        order = await _refresh_stock_order(_require_order_ok(result))
-        return JSONResponse({"ok": True, "order": order, "result": result})
+        order0 = _require_order_ok(result)
+        order = await _refresh_stock_order(order0) if _refresh_unconfirmed_orders(order_type) else order0
+        if cancel_task is not None and isinstance(preflight, dict) and "cached_cancel" not in preflight:
+            try:
+                cancel_info = await asyncio.wait_for(cancel_task, timeout=0.35)
+                if isinstance(cancel_info, dict):
+                    preflight["cached_cancel"] = cancel_info
+            except Exception:
+                pass
+        return JSONResponse({"ok": True, "order": order, "result": result, "preflight": preflight})
 
     @app.get("/api/tickers")
     async def tickers() -> JSONResponse:

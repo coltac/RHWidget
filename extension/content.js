@@ -81,6 +81,8 @@
     apiBase: "http://127.0.0.1:8787",
     pollMs: 2000,
     limit: 30,
+    fontFamily: "system",
+    fontSize: 12,
     symbolClickSelector: "",
     symbolTypeSelector: "",
     cursorPricePath: [],
@@ -92,6 +94,9 @@
     newsVisible: false,
     newsPos: null,
     newsSize: null,
+    tasVisible: false,
+    tasPos: null,
+    tasSize: null,
     orderType: "market",
     buyQtyMode: "dollars",
     buyQty: 1,
@@ -1351,6 +1356,7 @@
         </div>
         <div class="right">
           <button class="icon-btn bind-btn" title="Bind symbol input" type="button">B</button>
+          <button class="icon-btn tas-btn" title="Time & Sales" type="button">S</button>
           <button class="icon-btn train-btn" title="Train active-symbol region" type="button">T</button>
           <button class="icon-btn news-btn" title="News" type="button">N</button>
           <button class="icon-btn settings-btn" title="Settings" type="button">⚙</button>
@@ -1438,9 +1444,27 @@
       <div class="news-resizer" title="Resize"></div>
     `;
 
+    const tasWrap = document.createElement("div");
+    tasWrap.className = "rh-tas-widget hidden";
+    tasWrap.innerHTML = `
+      <div class="tas-header">
+        <div class="tas-title">Time &amp; Sales: <span class="tas-symbol">-</span></div>
+        <div class="tas-actions">
+          <button class="icon-btn tas-clear-btn" title="Clear" type="button">C</button>
+          <button class="icon-btn tas-close-btn" title="Close" type="button">X</button>
+        </div>
+      </div>
+      <div class="tas-body">
+        <div class="tas-status">select a tickerâ€¦</div>
+        <div class="tas-list"></div>
+      </div>
+      <div class="tas-resizer" title="Resize"></div>
+    `;
+
     shadow.appendChild(style);
     shadow.appendChild(wrap);
     shadow.appendChild(newsWrap);
+    shadow.appendChild(tasWrap);
 
     fetch(cssUrl)
       .then((r) => r.text())
@@ -1456,7 +1480,42 @@
       e.preventDefault();
       e.stopPropagation();
       e.stopImmediatePropagation?.();
-      if (chrome?.runtime?.openOptionsPage) chrome.runtime.openOptionsPage();
+      try {
+        chrome.runtime.sendMessage({ type: "rhwidget_open_options" });
+      } catch {
+        // Fallback: try direct open (some browsers may not expose openOptionsPage to content scripts).
+        try {
+          if (chrome?.runtime?.openOptionsPage) chrome.runtime.openOptionsPage();
+          else window.open(chrome.runtime.getURL("options.html"), "_blank", "noopener,noreferrer");
+        } catch {
+          // ignore
+        }
+      }
+    });
+
+    const tasBtn = wrap.querySelector(".tas-btn");
+    const tasCloseBtn = tasWrap.querySelector(".tas-close-btn");
+    const tasClearBtn = tasWrap.querySelector(".tas-clear-btn");
+    tasBtn?.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setTasVisible({ tasWrap }, tasWrap.classList.contains("hidden"));
+    });
+    tasCloseBtn?.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setTasVisible({ tasWrap }, false);
+    });
+    tasClearBtn?.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const list = tasWrap.querySelector(".tas-list");
+      if (list) list.textContent = "";
+      try {
+        window.dispatchEvent(new Event("rhwidget:tas-clear"));
+      } catch {
+        // ignore
+      }
     });
 
     const newsBtn = wrap.querySelector(".news-btn");
@@ -1590,6 +1649,8 @@
     const resizer = wrap.querySelector(".resizer");
     const newsHeader = newsWrap.querySelector(".news-header");
     const newsResizer = newsWrap.querySelector(".news-resizer");
+    const tasHeader = tasWrap.querySelector(".tas-header");
+    const tasResizer = tasWrap.querySelector(".tas-resizer");
 
     const startDrag = (downEvent) => {
       if (downEvent.button !== 0) return;
@@ -1739,11 +1800,88 @@
     newsHeader?.addEventListener("mousedown", startNewsDrag);
     newsResizer?.addEventListener("mousedown", startNewsResize);
 
+    const startTasDrag = (downEvent) => {
+      if (downEvent.button !== 0) return;
+      if (downEvent.target?.closest?.("button,a,input,select,textarea")) return;
+      downEvent.preventDefault();
+      downEvent.stopPropagation();
+
+      tasWrap.dataset.interacting = "1";
+      const rect = tasWrap.getBoundingClientRect();
+      const startX = downEvent.clientX;
+      const startY = downEvent.clientY;
+      const offsetX = startX - rect.left;
+      const offsetY = startY - rect.top;
+
+      tasWrap.style.right = "auto";
+      tasWrap.style.left = `${rect.left}px`;
+      tasWrap.style.top = `${rect.top}px`;
+
+      const onMove = (moveEvent) => {
+        const x = Math.min(
+          Math.max(0, moveEvent.clientX - offsetX),
+          Math.max(0, window.innerWidth - rect.width)
+        );
+        const y = Math.min(
+          Math.max(0, moveEvent.clientY - offsetY),
+          Math.max(0, window.innerHeight - rect.height)
+        );
+        tasWrap.style.left = `${x}px`;
+        tasWrap.style.top = `${y}px`;
+      };
+
+      const onUp = () => {
+        window.removeEventListener("mousemove", onMove, true);
+        window.removeEventListener("mouseup", onUp, true);
+        delete tasWrap.dataset.interacting;
+        saveTasLayout({ tasWrap });
+      };
+
+      window.addEventListener("mousemove", onMove, true);
+      window.addEventListener("mouseup", onUp, true);
+    };
+
+    const startTasResize = (downEvent) => {
+      if (downEvent.button !== 0) return;
+      downEvent.preventDefault();
+      downEvent.stopPropagation();
+
+      tasWrap.dataset.interacting = "1";
+      const rect = tasWrap.getBoundingClientRect();
+      const startX = downEvent.clientX;
+      const startY = downEvent.clientY;
+      const startW = rect.width;
+      const startH = rect.height;
+
+      const onMove = (moveEvent) => {
+        const dx = moveEvent.clientX - startX;
+        const dy = moveEvent.clientY - startY;
+        const w = Math.min(Math.max(260, startW + dx), window.innerWidth - rect.left - 8);
+        const h = Math.min(Math.max(180, startH + dy), window.innerHeight - rect.top - 8);
+        tasWrap.style.width = `${w}px`;
+        tasWrap.style.height = `${h}px`;
+      };
+
+      const onUp = () => {
+        window.removeEventListener("mousemove", onMove, true);
+        window.removeEventListener("mouseup", onUp, true);
+        delete tasWrap.dataset.interacting;
+        saveTasLayout({ tasWrap });
+      };
+
+      window.addEventListener("mousemove", onMove, true);
+      window.addEventListener("mouseup", onUp, true);
+    };
+
+    tasHeader?.addEventListener("mousedown", startTasDrag);
+    tasResizer?.addEventListener("mousedown", startTasResize);
+
     applyNewsLayout({ wrap, newsWrap }, currentCfg);
+    applyTasLayout({ wrap, newsWrap, tasWrap }, currentCfg);
 
     const mount = document.body || document.documentElement;
     mount.appendChild(root);
-    return { root, shadow, wrap, newsWrap };
+    return { root, shadow, wrap, newsWrap, tasWrap };
   }
 
   function setVisible(ui, visible) {
@@ -1784,6 +1922,27 @@
     if (size && Number.isFinite(size.width) && Number.isFinite(size.height)) {
       wrap.style.width = `${Math.max(240, Math.round(size.width))}px`;
       wrap.style.height = `${Math.max(200, Math.round(size.height))}px`;
+    }
+  }
+
+  function applyWidgetTypography(ui, cfg) {
+    const famKey = String(cfg?.fontFamily || DEFAULTS.fontFamily || "system").trim().toLowerCase();
+    const fontMap = {
+      system: "system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif",
+      segoe: "Segoe UI, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif",
+      roboto: "Roboto, system-ui, -apple-system, Segoe UI, Helvetica, Arial, sans-serif",
+      arial: "Arial, Helvetica, system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
+      tahoma: "Tahoma, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif",
+      verdana: "Verdana, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif",
+      mono: "ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace"
+    };
+    const family = fontMap[famKey] || fontMap.system;
+    const sizeRaw = Number(cfg?.fontSize);
+    const size = Number.isFinite(sizeRaw) ? Math.max(9, Math.min(22, Math.round(sizeRaw))) : DEFAULTS.fontSize;
+    const targets = [ui.wrap, ui.newsWrap, ui.tasWrap].filter(Boolean);
+    for (const el of targets) {
+      el.style.setProperty("--rhwidget-font-family", family);
+      el.style.setProperty("--rhwidget-font-size", `${size}px`);
     }
   }
 
@@ -1851,6 +2010,68 @@
 
   function applyNewsVisible(ui, visible) {
     const wrap = ui.newsWrap;
+    if (!wrap) return;
+    wrap.classList.toggle("hidden", !visible);
+  }
+
+  function applyTasLayout(ui, cfg) {
+    const wrap = ui.tasWrap;
+    if (!wrap) return;
+    if (wrap.dataset?.interacting === "1") return;
+
+    const pos = cfg?.tasPos;
+    const size = cfg?.tasSize;
+
+    if (pos && Number.isFinite(pos.left) && Number.isFinite(pos.top)) {
+      wrap.style.right = "auto";
+      wrap.style.left = `${Math.max(0, Math.round(pos.left))}px`;
+      wrap.style.top = `${Math.max(0, Math.round(pos.top))}px`;
+    } else if (wrap.dataset?.defaultPlaced !== "1") {
+      try {
+        const mainRect = ui.wrap.getBoundingClientRect();
+        const newsRect = ui.newsWrap?.getBoundingClientRect?.();
+        const baseLeft = newsRect?.left ?? mainRect.left;
+        const baseTop = (newsRect?.top ?? mainRect.top) + (newsRect?.height ?? mainRect.height) + 12;
+        wrap.style.right = "auto";
+        wrap.style.left = `${Math.max(0, Math.round(baseLeft))}px`;
+        wrap.style.top = `${Math.max(0, Math.round(baseTop))}px`;
+      } catch {
+        // ignore
+      }
+      wrap.dataset.defaultPlaced = "1";
+    }
+
+    if (size && Number.isFinite(size.width) && Number.isFinite(size.height)) {
+      wrap.style.width = `${Math.max(260, Math.round(size.width))}px`;
+      wrap.style.height = `${Math.max(180, Math.round(size.height))}px`;
+    } else if (wrap.dataset?.defaultSized !== "1") {
+      wrap.style.width = "420px";
+      wrap.style.height = "320px";
+      wrap.dataset.defaultSized = "1";
+    }
+  }
+
+  function saveTasLayout(ui) {
+    const wrap = ui.tasWrap;
+    if (!wrap) return;
+    const rect = wrap.getBoundingClientRect();
+    const pos = { left: Math.round(rect.left), top: Math.round(rect.top) };
+    const size = { width: Math.round(rect.width), height: Math.round(rect.height) };
+    chrome.storage.local.set({ tasPos: pos, tasSize: size });
+    currentCfg.tasPos = pos;
+    currentCfg.tasSize = size;
+  }
+
+  function setTasVisible(ui, visible) {
+    const wrap = ui.tasWrap;
+    if (!wrap) return;
+    wrap.classList.toggle("hidden", !visible);
+    chrome.storage.local.set({ tasVisible: !!visible });
+    currentCfg.tasVisible = !!visible;
+  }
+
+  function applyTasVisible(ui, visible) {
+    const wrap = ui.tasWrap;
     if (!wrap) return;
     wrap.classList.toggle("hidden", !visible);
   }
@@ -2015,6 +2236,54 @@
       return null;
     }
 
+    function parseCompactNumber(text) {
+      const s0 = String(text || "").trim();
+      if (!s0) return null;
+      const s = s0.replace(/[$,\s]/g, "");
+      if (!s || s === "-" || s.toLowerCase() === "n/a" || s === "â€”") return null;
+      const m = s.match(/^(-?\d*\.?\d+)([KMBT])?$/i);
+      if (!m) {
+        const n = Number(s);
+        return Number.isFinite(n) ? n : null;
+      }
+      const base = Number(m[1]);
+      if (!Number.isFinite(base)) return null;
+      const suf = String(m[2] || "").toUpperCase();
+      const mult =
+        suf === "K"
+          ? 1_000
+          : suf === "M"
+            ? 1_000_000
+            : suf === "B"
+              ? 1_000_000_000
+              : suf === "T"
+                ? 1_000_000_000_000
+                : 1;
+      return base * mult;
+    }
+
+    function parsePercentish(text) {
+      const s = String(text || "").trim();
+      if (!s) return null;
+      const cleaned = s.replace(/[%,$,\s]/g, "");
+      const n = Number(cleaned);
+      return Number.isFinite(n) ? n : null;
+    }
+
+    // Returns an estimated "relative volume percent" (e.g., 520 means 520%).
+    function parseRvolPercent(text) {
+      const s = String(text || "").trim();
+      if (!s) return null;
+      const n = parsePercentish(s);
+      if (n == null) return null;
+      // If explicitly a percent, keep it.
+      if (s.includes("%")) return n;
+      // Many scanners report RVOL as a multiple (e.g., 5.2 == 520%).
+      if (n > 0 && n <= 50) return n * 100;
+      // Otherwise assume it's already a percent-like number.
+      return n;
+    }
+
     const theadRow = ui.wrap.querySelector(".thead-row");
     const tbody = ui.wrap.querySelector(".tbody");
     theadRow.textContent = "";
@@ -2028,6 +2297,8 @@
 
     for (const item of limitedRows) {
       const sym = String(item?.symbol || "").trim().toUpperCase();
+      const hasNews = !!item?.has_news;
+      const isHod = !!item?.is_hod;
       const values = item?.values || {};
       if (!sym) continue;
 
@@ -2038,7 +2309,8 @@
         if (c.kind === "symbol") {
           const a = document.createElement("a");
           a.href = "#";
-          a.textContent = sym;
+          if (hasNews) a.classList.add("has-news");
+          a.textContent = `${hasNews ? "★ " : ""}${sym}${isHod ? " (HOD)" : ""}`;
           // Prevent Robinhood "outside click" handlers from closing the search UI mid-activation.
           a.addEventListener("pointerdown", (e) => {
             e.preventDefault();
@@ -2059,7 +2331,50 @@
           td.appendChild(a);
         } else {
           const raw = pickValue(values, c.match || []);
-          td.textContent = raw || "";
+          if (c.label === "Volume") {
+            const span = document.createElement("span");
+            span.className = "cell-pill";
+            span.textContent = raw || "";
+
+            let rvolPct = null;
+            const serverRvol = Number(item?.rvol_pct);
+            if (Number.isFinite(serverRvol) && serverRvol > 0) {
+              rvolPct = serverRvol;
+            } else {
+              const rvolRaw = pickValue(values, [
+                "rvol",
+                "rvol(%)",
+                "rvol%",
+                "relvol",
+                "rel vol",
+                "relativevol",
+                "relative vol",
+                "relativevolume",
+                "relative volume"
+              ]);
+              rvolPct = parseRvolPercent(rvolRaw);
+            }
+            if (rvolPct != null && rvolPct >= 500) span.classList.add("rvol-hot");
+            if (rvolPct != null && Number.isFinite(rvolPct)) span.title = `RVOL ${Math.round(rvolPct)}%`;
+            const tv = Number(item?.today_volume);
+            if (Number.isFinite(tv) && tv > 0) {
+              const tvText = Intl.NumberFormat().format(Math.round(tv));
+              span.title = span.title ? `${span.title} · Vol ${tvText}` : `Vol ${tvText}`;
+            }
+
+            td.textContent = "";
+            td.appendChild(span);
+          } else if (c.label === "Float") {
+            const span = document.createElement("span");
+            span.className = "cell-pill";
+            span.textContent = raw || "";
+            const f = parseCompactNumber(raw);
+            if (f != null && f > 0 && f < 20_000_000) span.classList.add("float-low");
+            td.textContent = "";
+            td.appendChild(span);
+          } else {
+            td.textContent = raw || "";
+          }
           if (c.kind === "signed") {
             const n = parseSignedNumber(raw);
             if (n != null) td.dataset.signed = n > 0 ? "pos" : n < 0 ? "neg" : "zero";
@@ -2424,13 +2739,190 @@
     }
   }
 
+  function _formatTasTime(ts) {
+    if (!ts) return "";
+    const d = new Date(ts);
+    if (!Number.isFinite(d.getTime())) return String(ts);
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    const ss = String(d.getSeconds()).padStart(2, "0");
+    const ms = String(d.getMilliseconds()).padStart(3, "0");
+    return `${hh}:${mm}:${ss}.${ms}`;
+  }
+
+  function _setTasStatus(ui, text) {
+    const el = ui.tasWrap?.querySelector?.(".tas-status");
+    if (el) el.textContent = text || "";
+  }
+
+  function _setTasSymbol(ui, symbol) {
+    const el = ui.tasWrap?.querySelector?.(".tas-symbol");
+    if (el) el.textContent = symbol || "-";
+  }
+
+  function _appendTasTrade(ui, trade, state) {
+    const list = ui.tasWrap?.querySelector?.(".tas-list");
+    if (!list) return;
+
+    const price = Number(trade?.price);
+    const size = Number(trade?.size);
+    const ts = String(trade?.ts || "").trim();
+    const exch = String(trade?.exchange || trade?.x || "").trim();
+
+    const row = document.createElement("div");
+    row.className = "tas-row";
+
+    const timeEl = document.createElement("div");
+    timeEl.className = "tas-time";
+    timeEl.textContent = _formatTasTime(ts);
+
+    const priceEl = document.createElement("div");
+    priceEl.className = "tas-price";
+    if (Number.isFinite(price) && price > 0) priceEl.textContent = price.toFixed(2);
+    else priceEl.textContent = String(trade?.price ?? "-");
+
+    let dir = "flat";
+    if (Number.isFinite(price) && price > 0 && Number.isFinite(state.lastPrice) && state.lastPrice > 0) {
+      if (price > state.lastPrice) dir = "up";
+      else if (price < state.lastPrice) dir = "down";
+    }
+    row.dataset.dir = dir;
+    if (Number.isFinite(price) && price > 0) state.lastPrice = price;
+
+    const sizeEl = document.createElement("div");
+    sizeEl.className = "tas-size";
+    if (Number.isFinite(size) && size > 0) sizeEl.textContent = String(Math.round(size));
+    else sizeEl.textContent = String(trade?.size ?? "-");
+
+    const exchEl = document.createElement("div");
+    exchEl.className = "tas-exch";
+    exchEl.textContent = exch || "";
+
+    row.appendChild(timeEl);
+    row.appendChild(priceEl);
+    row.appendChild(sizeEl);
+    row.appendChild(exchEl);
+
+    list.prepend(row);
+
+    const maxRows = 220;
+    while (list.childElementCount > maxRows) {
+      list.lastElementChild?.remove();
+    }
+  }
+
+  async function tasLoop(ui) {
+    let es = null;
+    let prevSymbol = "";
+    const state = { lastPrice: null };
+    let clearRequested = false;
+
+    window.addEventListener("rhwidget:tas-clear", () => {
+      clearRequested = true;
+    });
+
+    const closeStream = () => {
+      try {
+        es?.close?.();
+      } catch {
+        // ignore
+      }
+      es = null;
+    };
+
+    const openStream = (symbol) => {
+      closeStream();
+      state.lastPrice = null;
+      _setTasStatus(ui, "connectingâ€¦");
+      _setTasSymbol(ui, symbol);
+      try {
+        const base = String(currentCfg.apiBase || DEFAULTS.apiBase).replace(/\/$/, "");
+        const url = `${base}/api/tas/stream?symbol=${encodeURIComponent(symbol)}`;
+        es = new EventSource(url);
+      } catch {
+        es = null;
+        _setTasStatus(ui, "bridge offline");
+        return;
+      }
+
+      es.onmessage = (ev) => {
+        let msg = null;
+        try {
+          msg = JSON.parse(ev.data);
+        } catch {
+          msg = null;
+        }
+        if (!msg || typeof msg !== "object") return;
+        if (msg.type === "trade") {
+          _setTasStatus(ui, "");
+          _appendTasTrade(ui, msg, state);
+          return;
+        }
+        if (msg.type === "status") {
+          const st = String(msg.status || "").trim();
+          if (st) _setTasStatus(ui, st);
+          return;
+        }
+        if (msg.type === "error") {
+          const code = msg.code != null ? ` ${msg.code}` : "";
+          _setTasStatus(ui, `error${code}: ${String(msg.message || "alpaca_error")}`);
+          return;
+        }
+      };
+
+      es.onerror = () => {
+        // EventSource auto-reconnects; keep status lightweight.
+        _setTasStatus(ui, "reconnectingâ€¦");
+      };
+    };
+
+    while (true) {
+      const visible = !!currentCfg.tasVisible && isLegendRoute() && !ui.tasWrap?.classList.contains("hidden");
+      if (!visible) {
+        closeStream();
+        prevSymbol = "";
+        await sleep(700);
+        continue;
+      }
+
+      const symbol = detectActiveSymbol(ui) || "";
+      if (!symbol) {
+        closeStream();
+        prevSymbol = "";
+        _setTasSymbol(ui, "-");
+        _setTasStatus(ui, "select a tickerâ€¦");
+        await sleep(650);
+        continue;
+      }
+
+      if (clearRequested) {
+        clearRequested = false;
+        const list = ui.tasWrap?.querySelector?.(".tas-list");
+        if (list) list.textContent = "";
+        state.lastPrice = null;
+      }
+
+      if (symbol !== prevSymbol) {
+        prevSymbol = symbol;
+        const list = ui.tasWrap?.querySelector?.(".tas-list");
+        if (list) list.textContent = "";
+        openStream(symbol);
+      }
+
+      await sleep(450);
+    }
+  }
+
   async function initConfig(ui) {
     const cfg = await loadConfig();
     currentCfg = { ...DEFAULTS, ...cfg };
     applyWidgetLayout(ui, currentCfg);
+    applyWidgetTypography(ui, currentCfg);
     applyTradeUi(ui, currentCfg);
     applyNewsLayout(ui, currentCfg);
     applyNewsVisible(ui, !!currentCfg.newsVisible);
+    applyTasLayout(ui, currentCfg);
+    applyTasVisible(ui, !!currentCfg.tasVisible);
   }
 
   async function pollLoop(ui) {
@@ -2442,9 +2934,12 @@
       }
       const cfg = await loadConfig();
       currentCfg = { ...DEFAULTS, ...cfg };
+      applyWidgetTypography(ui, currentCfg);
       applyTradeUi(ui, currentCfg);
       applyNewsLayout(ui, currentCfg);
       applyNewsVisible(ui, !!currentCfg.newsVisible);
+      applyTasLayout(ui, currentCfg);
+      applyTasVisible(ui, !!currentCfg.tasVisible);
       if (!currentCfg.symbolClickSelector && cfg.symbolSelector) currentCfg.symbolClickSelector = cfg.symbolSelector;
       if (!currentCfg.symbolTypeSelector && cfg.symbolSelector) currentCfg.symbolTypeSelector = cfg.symbolSelector;
       const url = `${cfg.apiBase.replace(/\/$/, "")}/api/tickers`;
@@ -2500,5 +2995,6 @@
   cursorPriceLoop(ui);
   authLoop(ui);
   newsLoop(ui);
+  tasLoop(ui);
   pollLoop(ui);
 })();

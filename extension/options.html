@@ -23,6 +23,15 @@
         border-radius: 10px;
         font-size: 14px;
       }
+      select {
+        margin-top: 6px;
+        width: 100%;
+        padding: 8px 10px;
+        border: 1px solid #ccc;
+        border-radius: 10px;
+        font-size: 14px;
+        background: #fff;
+      }
       .row {
         display: grid;
         grid-template-columns: 1fr 1fr;
@@ -71,6 +80,27 @@
     <input id="limit" type="number" min="0" step="1" />
     <div class="hint">0 means no limit.</div>
 
+    <div class="row">
+      <div>
+        <label for="fontFamily">Widget Font</label>
+        <select id="fontFamily">
+          <option value="system">System (default)</option>
+          <option value="segoe">Segoe UI</option>
+          <option value="roboto">Roboto</option>
+          <option value="arial">Arial</option>
+          <option value="tahoma">Tahoma</option>
+          <option value="verdana">Verdana</option>
+          <option value="mono">Monospace</option>
+        </select>
+        <div class="hint">Applies to the widget and the news panel.</div>
+      </div>
+      <div>
+        <label for="fontSize">Widget Font Size (px)</label>
+        <input id="fontSize" type="number" min="9" max="22" step="1" />
+        <div class="hint">Try 11â€“16.</div>
+      </div>
+    </div>
+
     <div class="actions">
       <button id="save" type="button">Save</button>
       <button id="reset" type="button">Reset Defaults</button>
@@ -80,4 +110,3 @@
     <script src="options.js"></script>
   </body>
 </html>
-
